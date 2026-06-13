@@ -1,1898 +1,1484 @@
 /**
- * ================================================================
- * EcoPulse — Carbon Footprint Awareness Platform
- * ================================================================
- *
- * Architecture:
- *   1. CarbonCalculator  — Pure calculation engine (console-testable)
- *   2. CarbonDatabase    — Static data: items, tips, challenges, badges
- *   3. AppState          — Persistent state machine (localStorage)
- *   4. UIController      — DOM rendering & event wiring
- *
- * All user-facing text is set via textContent / setAttribute to
- * prevent XSS. innerHTML is only used for static, developer-controlled
- * template strings that contain NO user data.
- * ================================================================
+ * EcoPulse - Carbon Footprint Tracker Application Logic
+ * Implements: Calculations Engine, State Manager, UI Renderers, Chart Controllers, and Accessibility Handlers.
  */
 
-/* =================================================================
-   1. CARBON CALCULATOR — Pure Utility (window-exported for testing)
-================================================================= */
-
-/**
- * CarbonCalculator provides pure functions that convert user inputs
- * into annual CO₂-equivalent emissions in metric tonnes.
- *
- * Emission factors are sourced from:
- *   - UK BEIS / DEFRA 2023 conversion factors
- *   - EPA GHG Equivalencies
- *   - Our World in Data aggregates
- *
- * Usage (browser console):
- *   CarbonCalculator.calculate({ vehicleType:'none', ... })
- */
-const CarbonCalculator = (() => {
-  'use strict';
-
-  /* ---- Emission Factors ---- */
-
-  /**
-   * Vehicle emission factors in kg CO₂ per km driven.
-   * Source: BEIS 2023 & EPA average fleet.
-   */
-  const VEHICLE_FACTORS = {
-    none: 0,
-    electric: 0.05,        // ~50g/km (grid-average charging)
-    small_petrol: 0.14,    // Small car <1.4L
-    medium_petrol: 0.19,   // Medium car 1.4-2.0L
-    large_petrol: 0.28,    // Large SUV >2.0L
-    motorbike: 0.11        // Average motorbike
-  };
-
-  /**
-   * Flight emissions per single flight (kg CO₂).
-   * Includes radiative forcing multiplier of ~1.9.
-   */
-  const FLIGHT_FACTORS = {
-    short: 250,   // ~250 kg per short-haul flight
-    long: 1100    // ~1100 kg per long-haul flight
-  };
-
-  /** Public transit: kg CO₂ per hour of use (bus/metro blend) */
-  const TRANSIT_PER_HOUR = 0.08;  // ~80g per hour
+// ==========================================
+// 1. Carbon Calculation Constants & Engine
+// ==========================================
+const CarbonCalculator = {
+  // Emission constants (units in kg CO2 per specified unit)
+  EMISSION_FACTORS: {
+    transport: {
+      petrol: 0.404,  // kg CO2 per mile (US EPA average passenger vehicle)
+      diesel: 0.450,  // kg CO2 per mile
+      electric: 0.110, // kg CO2 per mile (indirect grid charging average)
+      none: 0.0,      // kg CO2
+      transit: 0.060,  // kg CO2 per hour of public commuting (bus/train average)
+      flight: 1100.0   // kg CO2 per average trip (mix short/long haul)
+    },
+    energy: {
+      electricityCostPerKWh: 0.16, // average cost per kWh in USD
+      electricityCO2PerKWh: 0.400, // kg CO2 per kWh
+      gasCostPerTherm: 1.20,       // average cost per therm in USD
+      gasCO2PerTherm: 5.300        // kg CO2 per therm (domestic gas heating)
+    },
+    diet: {
+      mixed: 2800.0,       // kg CO2 per year
+      lowmeat: 2000.0,     // kg CO2 per year
+      vegetarian: 1400.0,   // kg CO2 per year
+      vegan: 900.0         // kg CO2 per year
+    },
+    consumption: {
+      shopping: [0, 200.0, 500.0, 1200.0, 2200.0], // mapping: level 1-4 shopping kg CO2 per year
+      waste: [0, -100.0, 300.0, 800.0]            // mapping: level 1-3 food waste kg CO2 per year
+    },
+    sorting: {
+      none: 0.0,
+      partial: -300.0, // recycling reduces total landfill waste footprint (kg CO2 per year)
+      strict: -600.0
+    }
+  },
 
   /**
-   * Electricity emission factor: kg CO₂ per kWh.
-   * US average grid intensity ~0.42 kg/kWh (EPA eGRID 2022).
+   * Main calculation engine converting input parameters to tonnes CO2e
+   * @param {Object} inputs Form values from wizard
+   * @returns {Object} Structured categories breakdown & total
    */
-  const ELECTRICITY_FACTOR = 0.42;
+  calculate: function(inputs) {
+    const factors = this.EMISSION_FACTORS;
+    
+    // -- TRANSPORT --
+    const weeklyMiles = Number(inputs.distance) || 0;
+    const vehicleType = inputs.vehicleType || 'petrol';
+    const vehicleRate = factors.transport[vehicleType] || 0;
+    const vehicleEmissions = (weeklyMiles * 52) * vehicleRate; // annual vehicle emissions in kg
+    
+    const transitHours = Number(inputs.transit) || 0;
+    const transitEmissions = (transitHours * 52) * factors.transport.transit;
+    
+    const annualFlights = Number(inputs.flights) || 0;
+    const flightEmissions = annualFlights * factors.transport.flight;
+    
+    const totalTransport = (vehicleEmissions + transitEmissions + flightEmissions) / 1000; // to tonnes
 
-  /**
-   * Heating fuel factors: kg CO₂ per therm or kWh-equivalent.
-   */
-  const HEATING_FACTORS = {
-    none: 0,
-    electric: 0.42,        // Same as grid electricity (per kWh)
-    natural_gas: 5.3,      // ~5.3 kg CO₂ per therm
-    oil: 10.2,             // ~10.2 kg CO₂ per gallon-equivalent therm
-    lpg: 6.0,              // ~6.0 kg CO₂ per therm
-    wood: 1.5              // ~1.5 kg (biogenic, lower net)
-  };
+    // -- HOME ENERGY --
+    const elecBill = Number(inputs.electricity) || 0;
+    const gasBill = Number(inputs.gas) || 0;
+    const greenPercent = Number(inputs.greenPercent) || 0;
 
-  /**
-   * Diet factors: annual food-related CO₂ in tonnes.
-   * Source: Poore & Nemecek (2018), Science.
-   */
-  const DIET_FACTORS = {
-    vegan: 1.5,
-    vegetarian: 1.7,
-    pescatarian: 1.9,
-    low_meat: 2.5,
-    medium_meat: 3.3,
-    high_meat: 3.9
-  };
+    const annualElecKWh = (elecBill * 12) / factors.energy.electricityCostPerKWh;
+    const baseElecEmissions = annualElecKWh * factors.energy.electricityCO2PerKWh;
+    // Green power offset
+    const elecEmissions = baseElecEmissions * (1 - (greenPercent / 100));
 
-  /** Food waste multiplier */
-  const WASTE_MULTIPLIERS = {
-    very_low: 0.9,
-    low: 1.0,
-    medium: 1.1,
-    high: 1.3
-  };
+    const annualGasTherms = (gasBill * 12) / factors.energy.gasCostPerTherm;
+    const gasEmissions = annualGasTherms * factors.energy.gasCO2PerTherm;
 
-  /** Shopping (clothing) annual kg CO₂ */
-  const SHOPPING_FACTORS = {
-    minimal: 50,
-    low: 150,
-    medium: 350,
-    high: 600,
-    very_high: 1000
-  };
+    const totalEnergy = (elecEmissions + gasEmissions) / 1000; // to tonnes
 
-  /** Electronics annual kg CO₂ */
-  const ELECTRONICS_FACTORS = {
-    none: 0,
-    low: 200,
-    medium: 500,
-    high: 900
-  };
+    // -- DIET & LIFESTYLE --
+    const dietType = inputs.dietType || 'mixed';
+    const dietEmissions = factors.diet[dietType] || factors.diet.mixed;
 
-  /** Streaming: kg CO₂ per hour per day annualised */
-  const STREAMING_FACTOR = 0.036 * 365; // ~13 kg/yr per daily hour
+    const shoppingIndex = Number(inputs.shopping) || 2;
+    const shoppingEmissions = factors.consumption.shopping[shoppingIndex] || 500.0;
 
-  /** Recycling offset fraction */
-  const RECYCLING_OFFSETS = {
-    none: 0,
-    basic: 0.05,
-    good: 0.10,
-    excellent: 0.18
-  };
+    const wasteIndex = Number(inputs.foodwaste) || 2;
+    const wasteEmissions = factors.consumption.waste[wasteIndex] || 300.0;
 
-  /* ---- Main Calculate Function ---- */
+    const totalDietLifestyle = (dietEmissions + shoppingEmissions + wasteEmissions) / 1000; // to tonnes
 
-  /**
-   * @param {Object} inputs — form values from onboarding wizard
-   * @returns {{ total, transport, energy, food, lifestyle, breakdown }}
-   */
-  function calculate(inputs) {
-    const i = sanitiseInputs(inputs);
+    // -- WASTE SORTING --
+    const sortingType = inputs.sortingLevel || 'partial';
+    const wasteOffset = (factors.sorting[sortingType] || 0) / 1000; // to tonnes (negative offset)
 
-    /* Transport */
-    const vehicleCO2 = (VEHICLE_FACTORS[i.vehicleType] || 0) * i.annualKm;
-    const flightCO2 = (i.flightsShort * FLIGHT_FACTORS.short)
-                    + (i.flightsLong * FLIGHT_FACTORS.long);
-    const transitCO2 = i.publicTransit * 52 * TRANSIT_PER_HOUR;
-    const transportKg = vehicleCO2 + flightCO2 + transitCO2;
-
-    /* Home Energy */
-    const greenFraction = 1 - (i.greenEnergyPct / 100);
-    const elecCO2 = (i.electricityKwh * 12 * ELECTRICITY_FACTOR * greenFraction) / i.householdSize;
-    const heatCO2 = (i.heatingUsage * 12 * (HEATING_FACTORS[i.heatingType] || 0)) / i.householdSize;
-    const energyKg = elecCO2 + heatCO2;
-
-    /* Diet & Food */
-    const baseDiet = (DIET_FACTORS[i.dietType] || 2.5) * 1000;  // to kg
-    const wasteMult = WASTE_MULTIPLIERS[i.foodWaste] || 1.0;
-    const localReduction = 1 - (i.localFoodPct / 100 * 0.1);    // max 10% reduction
-    const foodKg = baseDiet * wasteMult * localReduction;
-
-    /* Lifestyle */
-    const shoppingKg = SHOPPING_FACTORS[i.shoppingFreq] || 350;
-    const electronicsKg = ELECTRONICS_FACTORS[i.electronicsFreq] || 200;
-    const streamingKg = i.streamingHrs * STREAMING_FACTOR;
-    const recycleOffset = RECYCLING_OFFSETS[i.recyclingLevel] || 0;
-    const lifestyleKg = (shoppingKg + electronicsKg + streamingKg) * (1 - recycleOffset);
-
-    /* Total */
-    const totalKg = transportKg + energyKg + foodKg + lifestyleKg;
-    const totalTons = totalKg / 1000;
+    // Total Calculation (with a floor of 0.1 tonnes to prevent absolute zero profiles)
+    let total = totalTransport + totalEnergy + totalDietLifestyle + wasteOffset;
+    total = Math.max(0.1, total);
 
     return {
-      total: round(totalTons, 2),
-      transport: round(transportKg / 1000, 2),
-      energy: round(energyKg / 1000, 2),
-      food: round(foodKg / 1000, 2),
-      lifestyle: round(lifestyleKg / 1000, 2),
-      breakdown: {
-        vehicle: round(vehicleCO2 / 1000, 2),
-        flights: round(flightCO2 / 1000, 2),
-        transit: round(transitCO2 / 1000, 2),
-        electricity: round(elecCO2 / 1000, 2),
-        heating: round(heatCO2 / 1000, 2),
-        diet: round(baseDiet * wasteMult * localReduction / 1000, 2),
-        shopping: round(shoppingKg / 1000, 2),
-        electronics: round(electronicsKg / 1000, 2),
-        streaming: round(streamingKg / 1000, 2)
+      transport: parseFloat(totalTransport.toFixed(2)),
+      energy: parseFloat(totalEnergy.toFixed(2)),
+      dietLifestyle: parseFloat((totalDietLifestyle + wasteOffset).toFixed(2)),
+      total: parseFloat(total.toFixed(2))
+    };
+  }
+};
+
+// ==========================================
+// 2. Application State Manager
+// ==========================================
+const AppState = {
+  key: 'ecopulse_user_state',
+  
+  // Default Application Values
+  data: {
+    hasCalculated: false,
+    inputs: {
+      vehicleType: 'petrol',
+      distance: 100,
+      transit: 0,
+      flights: 0,
+      electricity: 80,
+      gas: 40,
+      greenPercent: 0,
+      dietType: 'mixed',
+      shopping: 2,
+      foodwaste: 2,
+      sortingLevel: 'partial'
+    },
+    breakdown: {
+      transport: 0.0,
+      energy: 0.0,
+      dietLifestyle: 0.0,
+      total: 0.0
+    },
+    history: [],
+    pledges: [], // list of active pledge IDs
+    completedToday: [], // list of pledge IDs completed today
+    xp: 0,
+    level: 1,
+    levelName: 'Novice',
+    streak: 0,
+    lastActiveDate: null,
+    lockedOffsets: 0.0, // locked-in offsets in tonnes
+    simulatedOffsets: {
+      trees: 0,
+      solar: 0,
+      credits: 0
+    }
+  },
+
+  load: function() {
+    try {
+      const saved = localStorage.getItem(this.key);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // Deep copy values to ensure safety
+        this.data = Object.assign({}, this.data, parsed);
+        this.data.inputs = Object.assign({}, this.data.inputs, parsed.inputs);
+        this.data.breakdown = Object.assign({}, this.data.breakdown, parsed.breakdown);
+        this.data.simulatedOffsets = Object.assign({}, this.data.simulatedOffsets, parsed.simulatedOffsets);
       }
-    };
-  }
-
-  /**
-   * Calculate offset requirements.
-   * @param {number} tonnes — CO₂ to offset
-   * @param {number} years  — time horizon
-   */
-  function calculateOffset(tonnes, years) {
-    const totalCO2 = tonnes * years;
-    return {
-      trees: Math.ceil(totalCO2 / 0.022),        // ~22 kg CO₂ per tree per year
-      solarPanels: Math.ceil(totalCO2 / 1.5),    // ~1.5t offset per panel over lifetime amortised
-      windCredits: Math.ceil(totalCO2 / 1.0),    // 1 credit = 1 tonne
-      costLow: round(totalCO2 * 10, 0),          // $10/tonne (voluntary market low)
-      costHigh: round(totalCO2 * 50, 0),         // $50/tonne (gold standard)
-      totalCO2: round(totalCO2, 2)
-    };
-  }
-
-  /* ---- Helpers ---- */
-
-  function sanitiseInputs(raw) {
-    return {
-      vehicleType: String(raw.vehicleType || 'none'),
-      annualKm: clamp(Number(raw.annualKm) || 0, 0, 200000),
-      flightsShort: clamp(Number(raw.flightsShort) || 0, 0, 100),
-      flightsLong: clamp(Number(raw.flightsLong) || 0, 0, 50),
-      publicTransit: clamp(Number(raw.publicTransit) || 0, 0, 168),
-      electricityKwh: clamp(Number(raw.electricityKwh) || 0, 0, 10000),
-      heatingType: String(raw.heatingType || 'none'),
-      heatingUsage: clamp(Number(raw.heatingUsage) || 0, 0, 500),
-      greenEnergyPct: clamp(Number(raw.greenEnergyPct) || 0, 0, 100),
-      householdSize: clamp(Number(raw.householdSize) || 1, 1, 20),
-      dietType: String(raw.dietType || 'low_meat'),
-      foodWaste: String(raw.foodWaste || 'medium'),
-      localFoodPct: clamp(Number(raw.localFoodPct) || 0, 0, 100),
-      shoppingFreq: String(raw.shoppingFreq || 'medium'),
-      electronicsFreq: String(raw.electronicsFreq || 'low'),
-      streamingHrs: clamp(Number(raw.streamingHrs) || 0, 0, 24),
-      recyclingLevel: String(raw.recyclingLevel || 'good')
-    };
-  }
-
-  function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
-  function round(val, decimals) { const f = Math.pow(10, decimals); return Math.round(val * f) / f; }
-
-  /* Public API */
-  return { calculate, calculateOffset, sanitiseInputs };
-})();
-
-/* Export to window for console testing */
-window.CarbonCalculator = CarbonCalculator;
-
-
-/* =================================================================
-   2. CARBON DATABASE — Static Content
-================================================================= */
-
-const CarbonDatabase = (() => {
-  'use strict';
-
-  /** Carbon footprint of common items (kg CO₂) */
-  const ITEMS = [
-    { name: 'Cup of Coffee', icon: '☕', co2: 0.21, unit: 'per cup', desc: 'Including milk, water heating, and cup' },
-    { name: 'Cup of Tea', icon: '🍵', co2: 0.02, unit: 'per cup', desc: 'Much lower than coffee due to less processing' },
-    { name: 'Glass of Beer', icon: '🍺', co2: 0.50, unit: 'per pint', desc: 'Brewing, refrigeration, and transport' },
-    { name: 'Plastic Bottle', icon: '🍶', co2: 0.08, unit: 'per bottle', desc: 'Production + disposal of 500ml PET bottle' },
-    { name: 'Reusable Water Bottle', icon: '💧', co2: 0.01, unit: 'per use', desc: 'Amortised over 500+ uses' },
-    { name: 'Hamburger', icon: '🍔', co2: 3.0, unit: 'per burger', desc: 'Beef patty with all the fixings' },
-    { name: 'Veggie Burger', icon: '🥗', co2: 0.5, unit: 'per burger', desc: 'Plant-based patty with toppings' },
-    { name: 'Chicken Breast', icon: '🍗', co2: 1.8, unit: 'per serving', desc: '200g serving including farming' },
-    { name: 'Slice of Pizza', icon: '🍕', co2: 0.6, unit: 'per slice', desc: 'Average cheese pizza slice' },
-    { name: 'Avocado', icon: '🥑', co2: 0.4, unit: 'per fruit', desc: 'Including water-intensive farming and shipping' },
-    { name: 'Banana', icon: '🍌', co2: 0.08, unit: 'per fruit', desc: 'One of the most eco-friendly fruits' },
-    { name: 'Apple', icon: '🍎', co2: 0.05, unit: 'per fruit', desc: 'Locally grown is even lower' },
-    { name: 'Rice (1kg)', icon: '🍚', co2: 2.7, unit: 'per kg', desc: 'Methane from paddy fields' },
-    { name: 'Pasta (1kg)', icon: '🍝', co2: 0.9, unit: 'per kg', desc: 'Durum wheat production' },
-    { name: '1 Hour Streaming', icon: '📺', co2: 0.036, unit: 'per hour', desc: 'Netflix/YouTube via data centres' },
-    { name: '1 Hour Gaming', icon: '🎮', co2: 0.06, unit: 'per hour', desc: 'Console/PC energy use + servers' },
-    { name: 'Google Search', icon: '🔍', co2: 0.0002, unit: 'per search', desc: 'Data centre energy for one query' },
-    { name: 'Email (no attachment)', icon: '📧', co2: 0.004, unit: 'per email', desc: 'Server storage and transmission' },
-    { name: 'Email with Attachment', icon: '📎', co2: 0.05, unit: 'per email', desc: '10x more than plain email' },
-    { name: 'New Smartphone', icon: '📱', co2: 70, unit: 'per device', desc: 'Manufacturing, mining rare metals' },
-    { name: 'New Laptop', icon: '💻', co2: 300, unit: 'per device', desc: 'Full lifecycle manufacturing' },
-    { name: 'New Pair of Jeans', icon: '👖', co2: 33.4, unit: 'per pair', desc: 'Cotton farming, dyeing, transport' },
-    { name: 'Cotton T-Shirt', icon: '👕', co2: 7.0, unit: 'per shirt', desc: 'Growing, manufacturing, shipping' },
-    { name: 'Load of Laundry', icon: '🧺', co2: 0.6, unit: 'per load', desc: 'Warm wash and tumble dry' },
-    { name: 'Cold Water Laundry', icon: '❄️', co2: 0.2, unit: 'per load', desc: 'Cold wash saves ~65% energy' },
-    { name: 'Driving 1 km', icon: '🚗', co2: 0.19, unit: 'per km', desc: 'Average medium petrol car' },
-    { name: 'Bus Ride (10 km)', icon: '🚌', co2: 0.8, unit: 'per trip', desc: 'Per-passenger shared emissions' },
-    { name: 'Train Ride (10 km)', icon: '🚆', co2: 0.4, unit: 'per trip', desc: 'Electric rail is even lower' },
-    { name: 'Short-Haul Flight', icon: '✈️', co2: 250, unit: 'per flight', desc: '~3hr domestic, incl. radiative forcing' },
-    { name: 'Long-Haul Flight', icon: '🌍', co2: 1100, unit: 'per flight', desc: 'Transatlantic round-trip equivalent' },
-    { name: 'Bath', icon: '🛁', co2: 2.6, unit: 'per bath', desc: 'Heating ~150L of water' },
-    { name: 'Shower (8 min)', icon: '🚿', co2: 0.9, unit: 'per shower', desc: 'Average gas-heated shower' },
-    { name: '1 kg of Beef', icon: '🥩', co2: 27, unit: 'per kg', desc: 'Highest food emission per weight' },
-    { name: '1 kg of Cheese', icon: '🧀', co2: 13.5, unit: 'per kg', desc: 'Dairy production is carbon intensive' },
-    { name: 'Glass of Milk', icon: '🥛', co2: 0.6, unit: 'per glass', desc: '~250ml serving' },
-    { name: 'Chocolate Bar', icon: '🍫', co2: 1.5, unit: 'per 100g', desc: 'Cocoa farming + processing' }
-  ];
-
-  /** Eco tips for accordion */
-  const TIPS = [
-    {
-      emoji: '🚗',
-      title: 'Switch to Active or Public Transport',
-      category: 'Transport',
-      categoryColor: '#3B82F6',
-      body: 'Transportation accounts for roughly 29% of greenhouse gas emissions. Every trip you can walk, cycle, or take public transit instead of driving makes a measurable difference.',
-      bullets: [
-        'Walk or cycle for trips under 3 km — it is faster than driving in most cities',
-        'Use public transit for your commute — a bus is 4× more efficient per passenger',
-        'Combine multiple errands into one trip to reduce cold starts',
-        'Consider carpooling or ride-sharing for longer distances'
-      ],
-      impact: 'Save up to 2.4 tonnes CO₂/year'
-    },
-    {
-      emoji: '🥦',
-      title: 'Reduce Meat Consumption',
-      category: 'Food',
-      categoryColor: '#10B981',
-      body: 'The global food system produces about 26% of all greenhouse gas emissions, and red meat is the single largest contributor. Even small dietary shifts create big impact.',
-      bullets: [
-        'Try "Meatless Mondays" — one day per week saves ~340 kg CO₂/year',
-        'Replace beef with chicken or plant protein for an immediate 5× reduction',
-        'Buy seasonal, local produce to cut food transport emissions',
-        'Reduce food waste — plan meals and use leftovers creatively'
-      ],
-      impact: 'Save up to 1.5 tonnes CO₂/year'
-    },
-    {
-      emoji: '⚡',
-      title: 'Optimize Home Energy Use',
-      category: 'Energy',
-      categoryColor: '#F59E0B',
-      body: 'Household energy use is one of the easiest categories to improve. Small habit changes and efficient appliances can slash your home emissions dramatically.',
-      bullets: [
-        'Switch to LED bulbs — they use 75% less energy and last 25× longer',
-        'Set your thermostat 1°C lower in winter — saves ~300 kg CO₂/year',
-        'Unplug devices on standby — phantom loads waste 5–10% of home energy',
-        'Switch to a certified green energy tariff from your utility provider',
-        'Wash clothes at 30°C instead of 60°C to halve laundry energy'
-      ],
-      impact: 'Save up to 1.8 tonnes CO₂/year'
-    },
-    {
-      emoji: '🛍️',
-      title: 'Embrace Conscious Consumption',
-      category: 'Lifestyle',
-      categoryColor: '#8B5CF6',
-      body: 'Every product you buy has an embedded carbon footprint from raw materials, manufacturing, shipping, and disposal. Buying less and buying better is powerful.',
-      bullets: [
-        'Choose quality over quantity — durable goods have lower lifetime emissions',
-        'Buy second-hand clothing, electronics, and furniture',
-        'Repair items instead of replacing them',
-        'Avoid fast fashion — the industry emits 1.2 billion tonnes CO₂ annually',
-        'Opt for minimal or recyclable packaging when shopping'
-      ],
-      impact: 'Save up to 1.0 tonnes CO₂/year'
-    },
-    {
-      emoji: '✈️',
-      title: 'Fly Less, Fly Smarter',
-      category: 'Transport',
-      categoryColor: '#3B82F6',
-      body: 'A single transatlantic flight can emit more CO₂ than many people produce in an entire year. Aviation is the most carbon-intensive way to travel.',
-      bullets: [
-        'Take trains for trips under 800 km — often faster door-to-door',
-        'Use video calls instead of flying for business meetings',
-        'When you must fly, choose economy class (3× less per seat than business)',
-        'Use direct flights — takeoffs and landings produce the most emissions',
-        'Offset unavoidable flights through certified carbon credits'
-      ],
-      impact: 'Save up to 2.0 tonnes CO₂/year per avoided long-haul flight'
-    },
-    {
-      emoji: '♻️',
-      title: 'Master Recycling & Waste Reduction',
-      category: 'Lifestyle',
-      categoryColor: '#8B5CF6',
-      body: 'Landfill waste produces methane, a greenhouse gas 80× more potent than CO₂ over 20 years. Proper waste management is crucial climate action.',
-      bullets: [
-        'Learn your local recycling rules — contamination ruins entire batches',
-        'Compost food scraps — diverts 30% of household waste from landfill',
-        'Use reusable bags, bottles, and containers to eliminate single-use plastics',
-        'Donate items you no longer need instead of throwing them away',
-        'Choose products with minimal or recyclable packaging'
-      ],
-      impact: 'Save up to 0.5 tonnes CO₂/year'
-    },
-    {
-      emoji: '💧',
-      title: 'Conserve Water & Energy Together',
-      category: 'Energy',
-      categoryColor: '#F59E0B',
-      body: 'Heating water for showers, baths, and laundry is one of the top household energy uses. Saving water directly saves energy and carbon.',
-      bullets: [
-        'Take 5-minute showers instead of baths — saves 80% of water heating energy',
-        'Install a low-flow showerhead — cuts water use by 40% with no comfort loss',
-        'Fix dripping taps — a single drip wastes 15,000+ litres per year',
-        'Use a dishwasher (fully loaded) instead of hand-washing — it uses less water',
-        'Collect rainwater for garden irrigation'
-      ],
-      impact: 'Save up to 0.4 tonnes CO₂/year'
-    }
-  ];
-
-  /** Challenges / Pledges */
-  const CHALLENGES = [
-    { id: 'car_free_3',      emoji: '🚶', title: 'Go Car-Free for 3 Days',           desc: 'Walk, cycle, or use public transit for all trips.',           xp: 75,  reduction: '4.5 kg CO₂', category: 'transport' },
-    { id: 'meatless_week',   emoji: '🥬', title: 'Meatless Week',                    desc: 'Eat fully vegetarian for 7 consecutive days.',                xp: 100, reduction: '6.5 kg CO₂', category: 'food' },
-    { id: 'cold_wash',       emoji: '❄️', title: 'Switch to Cold Water Wash',        desc: 'Do all laundry loads in cold water this week.',               xp: 40,  reduction: '2.0 kg CO₂', category: 'energy' },
-    { id: 'no_streaming',    emoji: '📵', title: 'Screen-Free Evening',              desc: 'No streaming or gaming after 8 PM for 5 days.',              xp: 50,  reduction: '0.9 kg CO₂', category: 'lifestyle' },
-    { id: 'reusable_bottle', emoji: '💧', title: 'Reusable Bottle Only',             desc: 'Use only reusable bottles for a full week.',                  xp: 30,  reduction: '0.5 kg CO₂', category: 'lifestyle' },
-    { id: 'local_food',      emoji: '🥕', title: 'Buy 100% Local This Week',        desc: 'Source all groceries from local farmers or markets.',         xp: 60,  reduction: '3.2 kg CO₂', category: 'food' },
-    { id: 'thermostat_down', emoji: '🌡️', title: 'Thermostat Down 2°C',            desc: 'Lower your heating by 2°C for the full week.',               xp: 55,  reduction: '4.0 kg CO₂', category: 'energy' },
-    { id: 'no_plastic',      emoji: '🚫', title: 'Zero Single-Use Plastic',          desc: 'Avoid all single-use plastics for 5 days.',                  xp: 65,  reduction: '1.2 kg CO₂', category: 'lifestyle' },
-    { id: 'bike_commute',    emoji: '🚴', title: 'Bike Commute Challenge',           desc: 'Cycle to work or school every day this week.',               xp: 80,  reduction: '8.0 kg CO₂', category: 'transport' },
-    { id: 'compost_week',    emoji: '🌱', title: 'Start Composting',                 desc: 'Compost all food scraps for 7 days.',                        xp: 45,  reduction: '2.5 kg CO₂', category: 'lifestyle' },
-    { id: 'led_swap',        emoji: '💡', title: 'LED Light Swap',                   desc: 'Replace 5 remaining incandescent bulbs with LEDs.',          xp: 35,  reduction: '1.8 kg CO₂', category: 'energy' },
-    { id: 'public_transit_w', emoji: '🚌', title: 'Public Transit Week',             desc: 'Use only public transit for commuting this week.',           xp: 70,  reduction: '7.0 kg CO₂', category: 'transport' }
-  ];
-
-  /** Badges / Achievements */
-  const BADGES = [
-    { id: 'first_step',       emoji: '🌱', name: 'First Step',         desc: 'Complete your first assessment',       condition: (s) => s.assessmentCount >= 1 },
-    { id: 'green_commuter',   emoji: '🚴', name: 'Green Commuter',    desc: 'Complete 3 transport challenges',      condition: (s) => countCategory(s, 'transport') >= 3 },
-    { id: 'home_innovator',   emoji: '💡', name: 'Home Innovator',    desc: 'Complete 3 energy challenges',         condition: (s) => countCategory(s, 'energy') >= 3 },
-    { id: 'clean_eater',      emoji: '🥗', name: 'Clean Eater',       desc: 'Complete 2 food challenges',           condition: (s) => countCategory(s, 'food') >= 2 },
-    { id: 'eco_warrior',      emoji: '⚔️', name: 'Eco Warrior',      desc: 'Earn 500+ total XP',                   condition: (s) => s.xp >= 500 },
-    { id: 'streak_7',         emoji: '🔥', name: 'Week Warrior',      desc: 'Maintain a 7-day streak',              condition: (s) => s.streak >= 7 },
-    { id: 'streak_30',        emoji: '🏆', name: 'Monthly Legend',     desc: 'Maintain a 30-day streak',             condition: (s) => s.streak >= 30 },
-    { id: 'carbon_zero',      emoji: '🌍', name: 'Carbon Zero Hero',  desc: 'Reach Level 5',                        condition: (s) => s.level >= 5 },
-    { id: 'knowledge_seeker', emoji: '📚', name: 'Knowledge Seeker',  desc: 'Search 10 items in carbon search',     condition: (s) => s.searchCount >= 10 },
-    { id: 'pledge_master',    emoji: '🎯', name: 'Pledge Master',     desc: 'Complete 6 total challenges',          condition: (s) => s.completedChallenges.length >= 6 }
-  ];
-
-  function countCategory(state, cat) {
-    return state.completedChallenges.filter(id => {
-      const ch = CHALLENGES.find(c => c.id === id);
-      return ch && ch.category === cat;
-    }).length;
-  }
-
-  /** Level thresholds */
-  const LEVELS = [
-    { level: 1, title: 'Eco Seedling',     xpRequired: 0 },
-    { level: 2, title: 'Green Sprout',     xpRequired: 100 },
-    { level: 3, title: 'Nature Guardian',  xpRequired: 300 },
-    { level: 4, title: 'Climate Champion', xpRequired: 600 },
-    { level: 5, title: 'Carbon Zero Hero', xpRequired: 1000 },
-    { level: 6, title: 'Earth Sage',       xpRequired: 1500 },
-    { level: 7, title: 'Planet Protector',  xpRequired: 2200 }
-  ];
-
-  /** Offset methods for educational cards */
-  const OFFSET_METHODS = [
-    { icon: '🌳', title: 'Tree Planting',           desc: 'A mature tree absorbs about 22 kg of CO₂ per year. Reforestation projects also restore habitats and protect biodiversity.', factor: '~22 kg CO₂/tree/year' },
-    { icon: '☀️', title: 'Solar Energy Credits',     desc: 'Investing in solar farms displaces fossil fuel electricity. One residential panel offsets ~1.5 tonnes CO₂ over its lifetime.', factor: '~1.5t CO₂/panel lifetime' },
-    { icon: '💨', title: 'Wind Energy Credits',      desc: 'Wind turbines produce clean electricity with near-zero operational emissions. Credits fund new installations.', factor: '~1.0t CO₂ per credit' },
-    { icon: '🌾', title: 'Soil Carbon Sequestration',desc: 'Regenerative agriculture practices capture carbon in soil. This method also improves food production and water retention.', factor: '~0.5t CO₂/hectare/year' },
-    { icon: '🌊', title: 'Blue Carbon (Mangroves)',  desc: 'Coastal ecosystems like mangroves store up to 10× more carbon than terrestrial forests per hectare.', factor: '~3.7t CO₂/hectare/year' },
-    { icon: '🔋', title: 'Clean Cookstove Projects', desc: 'Replacing traditional biomass stoves in developing nations reduces deforestation and indoor air pollution.', factor: '~2.0t CO₂/stove/year' }
-  ];
-
-  return { ITEMS, TIPS, CHALLENGES, BADGES, LEVELS, OFFSET_METHODS };
-})();
-
-
-/* =================================================================
-   3. APP STATE — Persistent State Machine
-================================================================= */
-
-const AppState = (() => {
-  'use strict';
-
-  const STORAGE_KEY = 'ecopulse_user_data';
-
-  /** Default blank state */
-  function defaultState() {
-    return {
-      hasCompletedOnboarding: false,
-      assessmentCount: 0,
-      inputs: {},
-      results: null,
-      history: [],          // Array of { date, total, transport, energy, food, lifestyle }
-      xp: 0,
-      level: 1,
-      streak: 0,
-      lastCheckInDate: null,
-      activePledges: [],    // Challenge IDs
-      completedChallenges: [], // Challenge IDs (all-time)
-      unlockedBadges: [],
-      searchCount: 0
-    };
-  }
-
-  let _state = defaultState();
-
-  /** Load from localStorage with corruption guard */
-  function load() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      // Validate structure
-      if (typeof parsed !== 'object' || parsed === null) return;
-      // Merge onto defaults (handles added fields gracefully)
-      _state = { ...defaultState(), ...parsed };
-      // Re-validate arrays
-      if (!Array.isArray(_state.history)) _state.history = [];
-      if (!Array.isArray(_state.activePledges)) _state.activePledges = [];
-      if (!Array.isArray(_state.completedChallenges)) _state.completedChallenges = [];
-      if (!Array.isArray(_state.unlockedBadges)) _state.unlockedBadges = [];
     } catch (e) {
-      console.warn('[EcoPulse] Corrupted localStorage, resetting state.', e);
-      _state = defaultState();
+      console.error("Corrupted local storage detected. Resetting state.", e);
     }
-  }
+  },
 
-  /** Persist to localStorage */
-  function save() {
+  save: function() {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(_state));
+      localStorage.setItem(this.key, JSON.stringify(this.data));
     } catch (e) {
-      console.error('[EcoPulse] Failed to save state:', e);
+      console.error("Failed to write state to local storage", e);
     }
+  },
+
+  addXP: function(amount) {
+    this.data.xp += amount;
+    const oldLevel = this.data.level;
+    // Level formula: 100 XP per level
+    this.data.level = Math.floor(this.data.xp / 100) + 1;
+    
+    // Titles based on levels
+    const levelsMap = {
+      1: 'Novice Eco-Explorer',
+      2: 'Green Trailblazer',
+      3: 'Carbon Combatant',
+      4: 'Climate Advocate',
+      5: 'Eco-Champion',
+      6: 'Earth Guardian'
+    };
+    this.data.levelName = levelsMap[this.data.level] || 'Earth Guardian';
+
+    this.save();
+    
+    // Return true if leveled up to trigger celebration UI
+    return this.data.level > oldLevel;
   }
+};
 
-  /** Get a copy of the state */
-  function get() { return { ..._state }; }
+// ==========================================
+// 3. Static Datasets (Pledges, Search & Edu)
+// ==========================================
+const PledgeLibrary = [
+  { id: 'p_bike', category: 'transport', title: 'Bike to Commute', co2: 4.2, xp: 15, desc: 'Avoid using vehicles for your commute. Ride a bike or walk.' },
+  { id: 'p_transit', category: 'transport', title: 'Ride Public Transit', co2: 3.1, xp: 12, desc: 'Ditch your personal passenger vehicle for bus or metro rails.' },
+  { id: 'p_carpool', category: 'transport', title: 'Carpool with Coworkers', co2: 2.0, xp: 10, desc: 'Share your vehicle ride to reduce average personal trip emissions.' },
+  
+  { id: 'p_coldwash', category: 'energy', title: 'Cold Water Washing', co2: 1.2, xp: 10, desc: 'Run laundry machines with cold cycles to avoid heating energy.' },
+  { id: 'p_leds', category: 'energy', title: 'Install LED Bulbs', co2: 1.8, xp: 15, desc: 'Replace standard fluorescent lamps with low-power LEDs.' },
+  { id: 'p_thermostat', category: 'energy', title: 'Thermostat Offset (-1°C)', co2: 2.5, xp: 12, desc: 'Lower heating/increase cooling by 1°C to optimize HVAC bills.' },
+  
+  { id: 'p_vegan', category: 'diet', title: 'Vegan Diet Day', co2: 5.2, xp: 20, desc: 'Avoid meat, dairy, and eggs entirely for a full calendar day.' },
+  { id: 'p_meatless', category: 'diet', title: 'Meatless Monday', co2: 3.5, xp: 15, desc: 'Swap beef/poultry for high-protein vegetarian alternatives.' },
+  { id: 'p_zerowaste', category: 'diet', title: 'Zero Food Waste Day', co2: 1.5, xp: 10, desc: 'Plan meals thoroughly to produce zero landfill food garbage.' },
+  { id: 'p_sort', category: 'diet', title: 'Meticulous Sorting', co2: 1.0, xp: 8, desc: 'Carefully sort plastic, paper, organic compost, and glass.' }
+];
 
-  /** Update state and persist */
-  function update(partial) {
-    Object.assign(_state, partial);
-    save();
+const BadgesLibrary = [
+  { id: 'b_calc', title: 'Self-Aware', desc: 'Conduct your first carbon footprint audit.', requirement: (s) => s.hasCalculated },
+  { id: 'b_level2', title: 'Eco-Pilot', desc: 'Reach level 2 by taking action.', requirement: (s) => s.level >= 2 },
+  { id: 'b_level5', title: 'Sustainability Sage', desc: 'Reach level 5.', requirement: (s) => s.level >= 5 },
+  { id: 'b_pledge3', title: 'Eco-Warrior', desc: 'Commit to 3 active pledges.', requirement: (s) => s.pledges.length >= 3 },
+  { id: 'b_offset', title: 'Carbon Neutralizer', desc: 'Mitigate emissions via offsetting.', requirement: (s) => s.lockedOffsets > 0 },
+  { id: 'b_streak5', title: 'Consistent Guardian', desc: 'Achieve a 5-day action streak.', requirement: (s) => s.streak >= 5 }
+];
+
+const FoodprintIndex = {
+  'beef': { val: 27.0, desc: 'kg CO₂e per kg. Extremely carbon-heavy due to methane emissions and land clearances.' },
+  'lamb': { val: 23.0, desc: 'kg CO₂e per kg. Ruminant livestock release high rates of methane gas.' },
+  'cheese': { val: 12.0, desc: 'kg CO₂e per kg. Dairy processing and milk supply chains require massive energy.' },
+  'pork': { val: 7.2, desc: 'kg CO₂e per kg. Moderate emissions, lower than beef but higher than poultry.' },
+  'chicken': { val: 5.0, desc: 'kg CO₂e per kg. Standard poultry has moderate grain farming carbon costs.' },
+  'fish': { val: 6.0, desc: 'kg CO₂e per kg (farmed). Transportation and refrigeration form core emissions.' },
+  'eggs': { val: 4.8, desc: 'kg CO₂e per kg. High density poultry feeding systems generate moderate footprints.' },
+  'rice': { val: 2.7, desc: 'kg CO₂e per kg. Flooded rice paddies support methane-producing bacteria.' },
+  'tofu': { val: 2.0, desc: 'kg CO₂e per kg. Plant protein from soybeans has very low emissions.' },
+  'milk': { val: 1.9, desc: 'kg CO₂e per liter (dairy). Pasture emissions and factory processing cost.' },
+  'oat milk': { val: 0.4, desc: 'kg CO₂e per liter. Vegan milks require fraction of land and water.' },
+  'coffee': { val: 0.3, desc: 'kg CO₂e per average cup. Logistics, roasting, and dairy additives contribution.' },
+  'avocado': { val: 0.8, desc: 'kg CO₂e per piece. High irrigation needs and overseas flight transit logistics.' },
+  'banana': { val: 0.4, desc: 'kg CO₂e per kg. Requires long distance shipping but very efficient growth.' },
+  'plastic bottle': { val: 0.1, desc: 'kg CO₂e per unit. Production from fossil fuel petroleum polymers.' },
+  'paper bag': { val: 0.05, desc: 'kg CO₂e per bag. High logging and paper milling manufacturing costs.' },
+  't-shirt': { val: 7.0, desc: 'kg CO₂e per piece. Cotton agricultural supply, weaving, and textile dyeing.' },
+  'jeans': { val: 16.0, desc: 'kg CO₂e per pair. Requires extensive weaving, stone washing, and shipping.' },
+  'laptop': { val: 320.0, desc: 'kg CO₂e per device. Industrial silicon refining and electronics clean rooms.' },
+  'smartphone': { val: 65.0, desc: 'kg CO₂e per device. Massive carbon emitted during rare earth minerals mining.' },
+  'flight nyc to london': { val: 920.0, desc: 'kg CO₂e per passenger (one way). Heavy high-altitude aviation jetfuel combustion.' },
+  'streaming 1hr': { val: 0.05, desc: 'kg CO₂e per hour. Remote network server grids and router infrastructure.' },
+  'email': { val: 0.02, desc: 'kg CO₂e (with large attachment). Remote server caching and power transmission.' },
+  'gas driving 1mi': { val: 0.4, desc: 'kg CO₂e per mile. Internal combustion engine petroleum fuel waste.' }
+};
+
+const EducationalArticles = [
+  {
+    title: 'Demystifying the Carbon Budget',
+    blocks: [
+      { type: 'p', text: 'A carbon budget is the cumulative amount of carbon dioxide emissions permitted over a period of time to keep global temperature increases within a safe threshold (like the 1.5°C Paris goal).' },
+      { type: 'p', text: 'Currently, the average global citizen has an annual carbon footprint of approximately 4.5 tonnes, whereas standard models suggest that limit must decrease to 2.0 tonnes per citizen by 2030 to prevent catastrophic temperature shifts.' }
+    ]
+  },
+  {
+    title: 'Decarbonizing Domestic Energy',
+    blocks: [
+      { type: 'p', text: 'Household electricity heating and cooling comprise nearly 30% of average household carbon footprints. Actions include:' },
+      { type: 'li', text: 'Switch to Renewables: Green grid tariffs source energy from wind and solar, dropping footprint directly.' },
+      { type: 'li', text: 'Unplug Vampires: Idle appliances consume standby power. Unplugging them can reduce emissions by 100kg CO₂ annually.' },
+      { type: 'li', text: 'Adjust Thermostats: Reducing thermostat settings by 1°C in winter can shave up to 10% off heating gas bills.' }
+    ]
+  },
+  {
+    title: 'The Environmental Food Chain',
+    blocks: [
+      { type: 'p', text: 'Ruminant livestock (like beef and lamb) require massive amounts of land and feed water. More critically, their digestive processes release large volumes of methane, a greenhouse gas with 28 times the heat-trapping capability of carbon dioxide over a 100-year timescale.' },
+      { type: 'p', text: 'Shifting even two dinners a week to low-carbon grains or soy alternatives yields greater emissions reductions than driving a fuel-efficient hybrid.' }
+    ]
   }
+];
 
-  /** Compute level from XP */
-  function computeLevel(xp) {
-    const levels = CarbonDatabase.LEVELS;
-    let currentLevel = levels[0];
-    for (const lvl of levels) {
-      if (xp >= lvl.xpRequired) currentLevel = lvl;
-    }
-    return currentLevel;
-  }
+// ==========================================
+// 4. Main Controller & Router
+// ==========================================
+const App = {
+  charts: {}, // holds chart instances
 
-  /** Get XP needed for next level */
-  function xpForNextLevel(xp) {
-    const levels = CarbonDatabase.LEVELS;
-    for (const lvl of levels) {
-      if (xp < lvl.xpRequired) return lvl.xpRequired;
-    }
-    return levels[levels.length - 1].xpRequired;
-  }
-
-  /** Reset */
-  function reset() {
-    _state = defaultState();
-    save();
-  }
-
-  load();
-
-  return { get, update, computeLevel, xpForNextLevel, reset, load };
-})();
-
-
-/* =================================================================
-   4. UI CONTROLLER — DOM Rendering & Events
-================================================================= */
-
-const UIController = (() => {
-  'use strict';
-
-  /* ---- Cached DOM References ---- */
-  const $ = (sel) => document.querySelector(sel);
-  const $$ = (sel) => document.querySelectorAll(sel);
-
-  let donutChart = null;
-  let lineChart = null;
-  let currentStep = 0;
-  const TOTAL_STEPS = 4;
-
-  /* ---- Initialisation ---- */
-
-  function init() {
-    initLucide();
-    bindEvents();
-    checkInitialRoute();
-  }
-
-  function initLucide() {
-    if (window.lucide) {
-      window.lucide.createIcons();
-    }
-  }
-
-  /* ---- Screen Management ---- */
-
-  function showScreen(screenId) {
-    $$('.screen').forEach(s => s.classList.remove('active'));
-    const screen = $('#' + screenId);
-    if (screen) {
-      screen.classList.add('active');
-      // Re-render Lucide icons on new screen
-      setTimeout(() => { if (window.lucide) window.lucide.createIcons(); }, 50);
-    }
-  }
-
-  function checkInitialRoute() {
-    const state = AppState.get();
-    if (state.hasCompletedOnboarding && state.results) {
-      showScreen('app-screen');
-      renderDashboard();
-      renderActionHub();
-      renderLearnTab();
-      renderOffsetTab();
+  init: function() {
+    AppState.load();
+    this.updateUserProgressUI();
+    this.checkStreakLogic();
+    
+    // Router logic: load calculator panel if first run, else load dashboard
+    if (!AppState.data.hasCalculated) {
+      this.switchPanel('welcome');
     } else {
-      showScreen('splash-screen');
+      this.switchPanel('dashboard');
     }
-  }
 
-  /* ---- Event Binding ---- */
+    // Set up Global Listeners
+    this.registerGlobalListeners();
+    
+    // Render dynamic components
+    PledgeManager.renderPledges();
+    PledgeManager.renderBadges();
+    SearchEngine.init();
+    EducationalFeed.init();
+    OffsetSimulator.init();
+  },
 
-  function bindEvents() {
-    /* Splash */
-    $('#start-assessment-btn').addEventListener('click', () => {
-      showScreen('calculator-screen');
-      currentStep = 0;
-      showStep(0);
-      updateLiveCounter();
-    });
-
-    $('#skip-to-dashboard-btn').addEventListener('click', () => {
-      const state = AppState.get();
-      if (state.hasCompletedOnboarding && state.results) {
-        showScreen('app-screen');
-        renderDashboard();
-        renderActionHub();
-        renderLearnTab();
-        renderOffsetTab();
-      } else {
-        showScreen('calculator-screen');
-        currentStep = 0;
-        showStep(0);
-        updateLiveCounter();
-      }
-    });
-
-    /* Calculator Nav */
-    $('#calc-prev-btn').addEventListener('click', () => {
-      if (currentStep > 0) {
-        currentStep--;
-        showStep(currentStep);
-      }
-    });
-
-    $('#calc-next-btn').addEventListener('click', () => {
-      if (currentStep < TOTAL_STEPS - 1) {
-        currentStep++;
-        showStep(currentStep);
-      } else {
-        finishAssessment();
-      }
-    });
-
-    /* Calculator inputs - live counter */
-    $$('#calculator-screen input, #calculator-screen select').forEach(el => {
-      el.addEventListener('change', updateLiveCounter);
-      el.addEventListener('input', updateLiveCounter);
-    });
-
-    /* Results → Dashboard */
-    $('#go-to-dashboard-btn').addEventListener('click', () => {
-      showScreen('app-screen');
-      renderDashboard();
-      renderActionHub();
-      renderLearnTab();
-      renderOffsetTab();
-    });
-
-    /* Recalculate */
-    $('#recalculate-btn').addEventListener('click', () => {
-      showScreen('calculator-screen');
-      currentStep = 0;
-      showStep(0);
-      updateLiveCounter();
-    });
-
-    /* Tab Navigation */
-    $$('.tab-btn').forEach(btn => {
-      btn.addEventListener('click', () => switchTab(btn.dataset.tab));
-    });
-
-    /* Simulate progress button */
-    $('#simulate-progress-btn').addEventListener('click', simulateProgress);
-
-    /* Carbon search */
-    $('#carbon-search-btn').addEventListener('click', performCarbonSearch);
-    $('#carbon-search-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') performCarbonSearch();
-    });
-
-    /* Search tags */
-    $$('.search-tag').forEach(tag => {
-      tag.addEventListener('click', () => {
-        $('#carbon-search-input').value = tag.dataset.query;
-        performCarbonSearch();
-      });
-    });
-
-    /* Offset calculator */
-    $('#calculate-offset-btn').addEventListener('click', performOffsetCalc);
-
-    /* Modals — close on Esc */
-    document.addEventListener('keydown', (e) => {
+  registerGlobalListeners: function() {
+    // Escape key listeners for modals to maintain accessibility
+    window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        closeModal('levelup-modal');
-        closeModal('badge-modal');
+        CalculatorWizard.closeModal();
+        this.closeLevelUpModal();
       }
     });
+  },
 
-    /* Modal close buttons */
-    $('#levelup-close-btn').addEventListener('click', () => closeModal('levelup-modal'));
-    $('#badge-close-btn').addEventListener('click', () => closeModal('badge-modal'));
+  switchPanel: function(panelId) {
+    // Hide all panels
+    const panels = document.querySelectorAll('.app-panel');
+    panels.forEach(p => p.classList.remove('active'));
 
-    /* Modal overlay click to close */
-    $$('.modal-overlay').forEach(overlay => {
-      overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) closeModal(overlay.id);
-      });
-    });
-  }
-
-  /* ---- Calculator Step Management ---- */
-
-  function showStep(step) {
-    $$('.calc-step').forEach((el, i) => {
-      el.classList.toggle('active', i === step);
+    // De-activate all sidebar buttons
+    const sidebarItems = document.querySelectorAll('.sidebar-menu .menu-item');
+    sidebarItems.forEach(item => item.classList.remove('active'));
+    sidebarItems.forEach(item => {
+      const btn = item.querySelector('button');
+      if (btn) btn.setAttribute('aria-selected', 'false');
     });
 
-    // Update progress dots
-    $$('.step-dot').forEach((dot, i) => {
-      dot.classList.remove('active', 'completed');
-      if (i === step) dot.classList.add('active');
-      else if (i < step) dot.classList.add('completed');
+    // Handle panels
+    let targetPanel = document.getElementById(`panel-${panelId}`);
+    if (!targetPanel) return;
+
+    targetPanel.classList.add('active');
+    
+    // Focus panel for accessibility reading
+    targetPanel.setAttribute('tabindex', '-1');
+    targetPanel.focus();
+
+    // Mark sidebar navigation item active
+    const menuEl = document.getElementById(`menu-${panelId}`);
+    if (menuEl) {
+      menuEl.classList.add('active');
+      const btn = menuEl.querySelector('button');
+      if (btn) btn.setAttribute('aria-selected', 'true');
+    }
+
+    // Custom view initializations
+    if (panelId === 'dashboard') {
+      this.renderDashboardData();
+    }
+  },
+
+  updateUserProgressUI: function() {
+    const levelDisplay = document.getElementById('user-level-display');
+    const xpDisplay = document.getElementById('user-xp-display');
+    const xpProgressBar = document.getElementById('xp-progressbar');
+    const xpBarFill = document.getElementById('xp-bar-fill');
+    const streakDisplay = document.getElementById('streak-count-val');
+    const co2SavedDisplay = document.getElementById('co2-saved-display');
+    
+    const xpLevelMin = (AppState.data.level - 1) * 100;
+    const xpInLevel = AppState.data.xp - xpLevelMin;
+    const levelPercent = Math.min(100, Math.max(0, xpInLevel));
+
+    if (levelDisplay) levelDisplay.textContent = `Lvl ${AppState.data.level} ${AppState.data.levelName}`;
+    if (xpDisplay) xpDisplay.textContent = `${AppState.data.xp} / ${AppState.data.level * 100} XP`;
+    
+    if (xpProgressBar) {
+      xpProgressBar.setAttribute('aria-valuenow', xpInLevel);
+      xpProgressBar.setAttribute('aria-valuemax', 100);
+    }
+    if (xpBarFill) {
+      xpBarFill.style.width = `${levelPercent}%`;
+    }
+
+    if (streakDisplay) streakDisplay.textContent = AppState.data.streak;
+    
+    // Compute total co2 saved
+    let totalSaved = 0;
+    // Add up history offsets/pledges
+    totalSaved += AppState.data.lockedOffsets * 1000; // tonnes to kg
+    // Pledges saved
+    AppState.data.completedToday.forEach(pid => {
+      const pl = PledgeLibrary.find(x => x.id === pid);
+      if (pl) totalSaved += pl.co2;
     });
 
-    // Update progress lines
-    $$('.step-line').forEach((line, i) => {
-      line.classList.toggle('completed', i < step);
-    });
+    if (co2SavedDisplay) co2SavedDisplay.textContent = totalSaved.toFixed(1);
+    
+    // Update streak label in Pledges page
+    const streakBarDisplay = document.getElementById('streak-bar-display');
+    if (streakBarDisplay) {
+      streakBarDisplay.textContent = `Streak: ${AppState.data.streak} Days`;
+    }
+  },
 
-    // Update buttons
-    $('#calc-prev-btn').disabled = step === 0;
-    const nextBtn = $('#calc-next-btn');
-    if (step === TOTAL_STEPS - 1) {
-      nextBtn.innerHTML = '';
-      const txt = document.createTextNode('See My Results ');
-      nextBtn.appendChild(txt);
-      const icon = document.createElement('i');
-      icon.setAttribute('data-lucide', 'bar-chart-2');
-      icon.setAttribute('aria-hidden', 'true');
-      nextBtn.appendChild(icon);
-      if (window.lucide) window.lucide.createIcons();
+  checkStreakLogic: function() {
+    const todayStr = new Date().toDateString();
+    const lastActiveStr = AppState.data.lastActiveDate;
+
+    if (!lastActiveStr) {
+      AppState.data.streak = 0;
     } else {
-      nextBtn.innerHTML = '';
-      const txt = document.createTextNode('Next ');
-      nextBtn.appendChild(txt);
-      const icon = document.createElement('i');
-      icon.setAttribute('data-lucide', 'chevron-right');
-      icon.setAttribute('aria-hidden', 'true');
-      nextBtn.appendChild(icon);
-      if (window.lucide) window.lucide.createIcons();
+      const today = new Date(todayStr);
+      const lastActive = new Date(lastActiveStr);
+      const diffTime = Math.abs(today - lastActive);
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+      if (diffDays === 1) {
+        // Daily streak continues
+        // (will increment once user performs a check-in action)
+      } else if (diffDays > 1) {
+        // Streak broken
+        AppState.data.streak = 0;
+      }
     }
-  }
+    AppState.save();
+  },
 
-  /* ---- Live Counter ---- */
-
-  function gatherInputs() {
-    return {
-      vehicleType: $('#vehicle-type').value,
-      annualKm: $('#annual-km').value,
-      flightsShort: $('#flights-short').value,
-      flightsLong: $('#flights-long').value,
-      publicTransit: $('#public-transit').value,
-      electricityKwh: $('#electricity-kwh').value,
-      heatingType: $('#heating-type').value,
-      heatingUsage: $('#heating-usage').value,
-      greenEnergyPct: $('#green-energy-pct').value,
-      householdSize: $('#household-size').value,
-      dietType: $('#diet-type').value,
-      foodWaste: $('#food-waste').value,
-      localFoodPct: $('#local-food-pct').value,
-      shoppingFreq: $('#shopping-freq').value,
-      electronicsFreq: $('#electronics-freq').value,
-      streamingHrs: $('#streaming-hrs').value,
-      recyclingLevel: $('#recycling-level').value
-    };
-  }
-
-  function updateLiveCounter() {
-    const inputs = gatherInputs();
-    const result = CarbonCalculator.calculate(inputs);
-    const el = $('#live-co2');
-    el.textContent = result.total.toFixed(1);
-    // Pulse animation
-    el.style.transform = 'scale(1.15)';
-    setTimeout(() => { el.style.transform = 'scale(1)'; }, 200);
-  }
-
-  /* ---- Finish Assessment ---- */
-
-  function finishAssessment() {
-    const inputs = gatherInputs();
-    const result = CarbonCalculator.calculate(inputs);
-    const state = AppState.get();
-
-    // Save to state
-    const historyEntry = {
-      date: new Date().toISOString().split('T')[0],
-      total: result.total,
-      transport: result.transport,
-      energy: result.energy,
-      food: result.food,
-      lifestyle: result.lifestyle
-    };
-
-    const newHistory = [...state.history, historyEntry];
-    // Keep last 20 entries
-    if (newHistory.length > 20) newHistory.splice(0, newHistory.length - 20);
-
-    AppState.update({
-      hasCompletedOnboarding: true,
-      assessmentCount: state.assessmentCount + 1,
-      inputs: inputs,
-      results: result,
-      history: newHistory
-    });
-
-    // Show results screen
-    showScreen('results-screen');
-    animateResults(result);
-
-    // Check for first-step badge
-    checkBadges();
-  }
-
-  /* ---- Results Animation ---- */
-
-  function animateResults(result) {
-    // Animate ring
-    const ringFill = $('#results-ring-fill');
-    const circumference = 2 * Math.PI * 85;  // ~534
-
-    // Add gradient defs to SVG if not already present
-    const svg = ringFill.closest('svg');
-    if (!svg.querySelector('#ringGrad')) {
-      const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-      const grad = document.createElementNS('http://www.w3.org/2000/svg', 'linearGradient');
-      grad.id = 'ringGrad';
-      grad.setAttribute('x1', '0%');
-      grad.setAttribute('y1', '0%');
-      grad.setAttribute('x2', '100%');
-      grad.setAttribute('y2', '100%');
-      const stop1 = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
-      stop1.setAttribute('offset', '0%');
-      stop1.setAttribute('stop-color', '#34D399');
-      const stop2 = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
-      stop2.setAttribute('offset', '100%');
-      stop2.setAttribute('stop-color', '#10B981');
-      grad.appendChild(stop1);
-      grad.appendChild(stop2);
-      defs.appendChild(grad);
-      svg.prepend(defs);
+  incrementStreak: function() {
+    const todayStr = new Date().toDateString();
+    if (AppState.data.lastActiveDate !== todayStr) {
+      AppState.data.streak += 1;
+      AppState.data.lastActiveDate = todayStr;
+      AppState.save();
+      this.updateUserProgressUI();
+      PledgeManager.renderBadges(); // reevaluate badges
     }
+  },
 
-    // Calculate fill percentage (cap at 20 tonnes = full)
-    const pct = Math.min(result.total / 20, 1);
-    const offset = circumference * (1 - pct);
+  renderDashboardData: function() {
+    if (!AppState.data.hasCalculated) return;
 
-    ringFill.style.strokeDasharray = circumference;
-    ringFill.style.strokeDashoffset = circumference;
+    const net = Math.max(0, AppState.data.breakdown.total - AppState.data.lockedOffsets);
+    
+    // Core values
+    document.getElementById('dash-footprint-val').textContent = AppState.data.breakdown.total.toFixed(2);
+    document.getElementById('dash-offset-val').textContent = AppState.data.lockedOffsets.toFixed(2);
+    document.getElementById('dash-net-val').textContent = net.toFixed(2);
 
-    requestAnimationFrame(() => {
-      setTimeout(() => {
-        ringFill.style.strokeDashoffset = offset;
-      }, 100);
-    });
+    // Comparer values
+    document.getElementById('comparison-user-val').textContent = `${net.toFixed(1)} tonnes`;
+    const percentWidth = Math.min(100, (net / 16.0) * 100);
+    document.getElementById('comparison-user-bar').style.width = `${percentWidth}%`;
 
-    // Animate number
-    animateNumber($('#results-total-co2'), 0, result.total, 1500);
+    // Dynamic Insights Cards
+    this.generateInsightsList(AppState.data.breakdown);
 
-    // Comparison badge
-    const badge = $('#results-badge');
-    const compText = $('#results-comparison-text');
+    // Render Charts
+    this.renderCharts(AppState.data.breakdown);
+  },
 
-    if (result.total <= 2.0) {
-      badge.textContent = '🌟 Exceptional — Below Paris Target!';
-      badge.className = 'comparison-badge';
-      compText.textContent = 'Your footprint is below the Paris Agreement 2030 target of 2.0 tonnes. You\'re leading the way!';
-    } else if (result.total <= 4.8) {
-      badge.textContent = '✅ Below Global Average';
-      badge.className = 'comparison-badge';
-      compText.textContent = 'Your footprint is below the global average of 4.8 tonnes. Great job — but there\'s always room to improve!';
-    } else if (result.total <= 10) {
-      badge.textContent = '⚠️ Above Global Average';
-      badge.className = 'comparison-badge warning';
-      compText.textContent = 'Your footprint is above the global average but below the US average. Small changes can make a big difference.';
-    } else {
-      badge.textContent = '🔴 High Footprint';
-      badge.className = 'comparison-badge danger';
-      compText.textContent = 'Your footprint is high. The good news? That means you have the most potential for impactful reduction.';
-    }
+  generateInsightsList: function(breakdown) {
+    const listContainer = document.getElementById('dashboard-insights-list');
+    if (!listContainer) return;
 
-    // Breakdown chips
-    const breakdownEl = $('#results-breakdown');
-    breakdownEl.innerHTML = '';
+    // Clear list securely
+    listContainer.textContent = '';
 
     const categories = [
-      { label: 'Transport', value: result.transport, color: '#3B82F6' },
-      { label: 'Energy', value: result.energy, color: '#F59E0B' },
-      { label: 'Food', value: result.food, color: '#10B981' },
-      { label: 'Lifestyle', value: result.lifestyle, color: '#8B5CF6' }
+      { name: 'Transport', val: breakdown.transport, id: 'transport' },
+      { name: 'Home Energy', val: breakdown.energy, id: 'energy' },
+      { name: 'Lifestyle/Diet', val: breakdown.dietLifestyle, id: 'diet' }
     ];
 
-    categories.forEach(cat => {
-      const chip = document.createElement('div');
-      chip.className = 'result-chip';
+    // Sort descending
+    categories.sort((a, b) => b.val - a.val);
+    const highest = categories[0];
+    const net = Math.max(0, breakdown.total - AppState.data.lockedOffsets);
 
-      const dot = document.createElement('span');
-      dot.className = 'result-chip-dot';
-      dot.style.backgroundColor = cat.color;
+    // 1. Highest emitting insight
+    const mainInsight = document.createElement('div');
+    mainInsight.className = 'insight-card warning';
+    
+    const warnIconDiv = document.createElement('div');
+    warnIconDiv.className = 'insight-icon warning';
+    const warnIcon = document.createElement('i');
+    warnIcon.setAttribute('data-lucide', 'alert-triangle');
+    warnIcon.style.width = '20px';
+    warnIcon.style.height = '20px';
+    warnIconDiv.appendChild(warnIcon);
+    mainInsight.appendChild(warnIconDiv);
 
-      const text = document.createElement('span');
-      text.textContent = cat.label + ': ' + cat.value.toFixed(1) + 't';
+    const warnContent = document.createElement('div');
+    warnContent.className = 'insight-content';
+    
+    const warnTitle = document.createElement('h4');
+    warnTitle.textContent = `Highest Output: ${highest.name}`;
+    warnContent.appendChild(warnTitle);
 
-      chip.appendChild(dot);
-      chip.appendChild(text);
-      breakdownEl.appendChild(chip);
-    });
-  }
-
-  /* ---- Dashboard Rendering ---- */
-
-  function renderDashboard() {
-    const state = AppState.get();
-    const result = state.results;
-    if (!result) return;
-
-    // Hero score
-    $('#dash-total-co2').textContent = result.total.toFixed(1);
-
-    // Grade
-    const gradeEl = $('#dash-grade');
-    if (result.total <= 2.0) {
-      gradeEl.textContent = '🌟 Exceptional';
-      gradeEl.style.background = 'rgba(16,185,129,0.2)';
-      gradeEl.style.color = '#34D399';
-    } else if (result.total <= 4.8) {
-      gradeEl.textContent = '✅ Below Average';
-      gradeEl.style.background = 'rgba(16,185,129,0.15)';
-      gradeEl.style.color = '#10B981';
-    } else if (result.total <= 10) {
-      gradeEl.textContent = '⚠️ Above Average';
-      gradeEl.style.background = 'rgba(245,158,11,0.15)';
-      gradeEl.style.color = '#F59E0B';
+    const warnText = document.createElement('p');
+    if (highest.id === 'transport') {
+      warnText.textContent = `Your transportation sector emits ${highest.val} tonnes annually. Consider pledging to walk/bike short commutes, carpooling, or decreasing flight intervals to drastically cut emissions.`;
+    } else if (highest.id === 'energy') {
+      warnText.textContent = `Domestic energy usage contributes ${highest.val} tonnes CO₂e. Try signing up for a green grid supplier option, implementing home solar, or dropping utility thermostats.`;
     } else {
-      gradeEl.textContent = '🔴 High Impact';
-      gradeEl.style.background = 'rgba(244,63,94,0.15)';
-      gradeEl.style.color = '#F43F5E';
+      warnText.textContent = `Diet and consumption styles represent ${highest.val} tonnes. Reducing beef consumption, implementing veggie check-ins, or sorting landfill waste mitigates output.`;
+    }
+    warnContent.appendChild(warnText);
+    mainInsight.appendChild(warnContent);
+    listContainer.appendChild(mainInsight);
+
+    // 2. Secondary comparative insight
+    const secondaryInsight = document.createElement('div');
+    const netTargetDiff = net - 2.0; // target 2.0 tonnes
+
+    if (netTargetDiff <= 0) {
+      secondaryInsight.className = 'insight-card success';
+      const greenIcon = document.createElement('div');
+      greenIcon.className = 'insight-icon success';
+      const successI = document.createElement('i');
+      successI.setAttribute('data-lucide', 'check-circle');
+      successI.style.width = '20px';
+      successI.style.height = '20px';
+      greenIcon.appendChild(successI);
+      secondaryInsight.appendChild(greenIcon);
+
+      const successContent = document.createElement('div');
+      successContent.className = 'insight-content';
+      
+      const successTitle = document.createElement('h4');
+      successTitle.textContent = 'Climate Target Achieved!';
+      successContent.appendChild(successTitle);
+
+      const successText = document.createElement('p');
+      successText.textContent = `Your net carbon index is under the Paris Accord threshold of 2.0 tonnes. Maintain your practices and pledges to lead by example.`;
+      successContent.appendChild(successText);
+      secondaryInsight.appendChild(successContent);
+    } else {
+      secondaryInsight.className = 'insight-card info';
+      const infoIcon = document.createElement('div');
+      infoIcon.className = 'insight-icon info';
+      const infoI = document.createElement('i');
+      infoI.setAttribute('data-lucide', 'info');
+      infoI.style.width = '20px';
+      infoI.style.height = '20px';
+      infoIcon.appendChild(infoI);
+      secondaryInsight.appendChild(infoIcon);
+
+      const infoContent = document.createElement('div');
+      infoContent.className = 'insight-content';
+
+      const infoTitle = document.createElement('h4');
+      infoTitle.textContent = 'Decarbonization Targets';
+      infoContent.appendChild(infoTitle);
+
+      const infoText = document.createElement('p');
+      infoText.textContent = `To reach the climate target, you must reduce your net footprint by another ${netTargetDiff.toFixed(1)} tonnes annually. Activate pledges or lock offsets to bridge the gap.`;
+      infoContent.appendChild(infoText);
+      secondaryInsight.appendChild(infoContent);
     }
 
-    // Insight text
-    const categories = [
-      { label: 'Transport', value: result.transport },
-      { label: 'Energy', value: result.energy },
-      { label: 'Food', value: result.food },
-      { label: 'Lifestyle', value: result.lifestyle }
-    ];
-    const sorted = [...categories].sort((a, b) => b.value - a.value);
-    const highest = sorted[0];
-    $('#dash-insight').textContent = 'Your highest category is ' + highest.label +
-      ' at ' + highest.value.toFixed(1) + 't CO₂/yr. Focus your reduction efforts here for maximum impact.';
+    listContainer.appendChild(secondaryInsight);
 
-    // Comparison bars
-    const maxVal = 16; // US average as baseline
-    const userPct = Math.min((result.total / maxVal) * 100, 100);
-    $('#comp-bar-user').style.width = userPct + '%';
-    $('#comp-val-user').textContent = result.total.toFixed(1) + 't';
-
-    // Donut chart
-    renderDonutChart(result);
-
-    // Breakdown cards
-    renderBreakdownCards(result);
-
-    // Line chart
-    renderLineChart();
-
-    // Insights
-    renderInsights(result);
-
-    // Update header stats
-    updateHeaderStats();
-  }
-
-  function renderDonutChart(result) {
-    const ctx = $('#donut-chart').getContext('2d');
-
-    if (donutChart) donutChart.destroy();
-
-    donutChart = new Chart(ctx, {
-      type: 'doughnut',
-      data: {
-        labels: ['Transport', 'Energy', 'Food', 'Lifestyle'],
-        datasets: [{
-          data: [result.transport, result.energy, result.food, result.lifestyle],
-          backgroundColor: ['#3B82F6', '#F59E0B', '#10B981', '#8B5CF6'],
-          borderColor: 'rgba(10,15,26,0.8)',
-          borderWidth: 3,
-          hoverBorderColor: '#ffffff',
-          hoverBorderWidth: 2
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: true,
-        cutout: '68%',
-        plugins: {
-          legend: {
-            position: 'bottom',
-            labels: {
-              color: '#9CA3AF',
-              font: { family: 'Inter', size: 11, weight: '600' },
-              padding: 16,
-              usePointStyle: true,
-              pointStyleWidth: 10
-            }
-          },
-          tooltip: {
-            backgroundColor: 'rgba(26,34,51,0.95)',
-            titleColor: '#F9FAFB',
-            bodyColor: '#9CA3AF',
-            titleFont: { family: 'Space Grotesk', weight: '700' },
-            bodyFont: { family: 'Inter' },
-            borderColor: 'rgba(16,185,129,0.3)',
-            borderWidth: 1,
-            cornerRadius: 12,
-            padding: 12,
-            callbacks: {
-              label: function(context) {
-                const val = context.parsed;
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const pct = ((val / total) * 100).toFixed(1);
-                return ' ' + context.label + ': ' + val.toFixed(2) + 't (' + pct + '%)';
-              }
-            }
-          }
-        },
-        animation: {
-          animateRotate: true,
-          animateScale: true,
-          duration: 1200,
-          easing: 'easeOutQuart'
-        }
-      }
-    });
-  }
-
-  function renderBreakdownCards(result) {
-    const grid = $('#breakdown-grid');
-    grid.innerHTML = '';
-
-    const cats = [
-      { key: 'transport', label: 'Transport', icon: 'car',          value: result.transport, color: '#3B82F6', bgColor: 'rgba(59,130,246,0.15)' },
-      { key: 'energy',    label: 'Energy',    icon: 'zap',          value: result.energy,    color: '#F59E0B', bgColor: 'rgba(245,158,11,0.15)' },
-      { key: 'food',      label: 'Food',      icon: 'apple',        value: result.food,      color: '#10B981', bgColor: 'rgba(16,185,129,0.15)' },
-      { key: 'lifestyle', label: 'Lifestyle', icon: 'shopping-bag', value: result.lifestyle,  color: '#8B5CF6', bgColor: 'rgba(139,92,246,0.15)' }
-    ];
-
-    const total = result.total || 1;
-
-    cats.forEach(cat => {
-      const pct = ((cat.value / total) * 100).toFixed(0);
-
-      const card = document.createElement('div');
-      card.className = 'breakdown-card';
-
-      const iconWrap = document.createElement('div');
-      iconWrap.className = 'breakdown-card-icon';
-      iconWrap.style.background = cat.bgColor;
-      iconWrap.style.color = cat.color;
-      const iconEl = document.createElement('i');
-      iconEl.setAttribute('data-lucide', cat.icon);
-      iconWrap.appendChild(iconEl);
-
-      const label = document.createElement('div');
-      label.className = 'breakdown-card-label';
-      label.textContent = cat.label;
-
-      const value = document.createElement('div');
-      value.className = 'breakdown-card-value';
-      value.textContent = cat.value.toFixed(2) + 't';
-      value.style.color = cat.color;
-
-      const bar = document.createElement('div');
-      bar.className = 'breakdown-card-bar';
-      const barFill = document.createElement('div');
-      barFill.className = 'breakdown-card-bar-fill';
-      barFill.style.background = cat.color;
-      barFill.style.width = '0%';
-      bar.appendChild(barFill);
-
-      const pctText = document.createElement('div');
-      pctText.className = 'breakdown-card-pct';
-      pctText.textContent = pct + '% of total';
-
-      card.appendChild(iconWrap);
-      card.appendChild(label);
-      card.appendChild(value);
-      card.appendChild(bar);
-      card.appendChild(pctText);
-      grid.appendChild(card);
-
-      // Animate bar
-      setTimeout(() => { barFill.style.width = pct + '%'; }, 300);
-    });
-
+    // Initialize lucide icons inside generated insights
     if (window.lucide) window.lucide.createIcons();
-  }
+  },
 
-  function renderLineChart() {
-    const state = AppState.get();
-    const history = state.history;
+  renderCharts: function(breakdown) {
+    if (!window.Chart) return;
 
-    const ctx = $('#line-chart').getContext('2d');
+    // 1. Donut Chart - Category Breakdown
+    const pieCtx = document.getElementById('categoryChart');
+    if (pieCtx) {
+      if (this.charts.pie) this.charts.pie.destroy();
 
-    if (lineChart) lineChart.destroy();
-
-    // If only 1 entry, add a fake "start" point slightly higher
-    let labels = history.map(h => h.date);
-    let data = history.map(h => h.total);
-
-    if (history.length === 0) {
-      labels = ['No data'];
-      data = [0];
-    }
-
-    lineChart = new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: labels,
-        datasets: [{
-          label: 'CO₂ (tonnes/yr)',
-          data: data,
-          borderColor: '#10B981',
-          backgroundColor: 'rgba(16,185,129,0.1)',
-          fill: true,
-          tension: 0.4,
-          pointBackgroundColor: '#10B981',
-          pointBorderColor: '#0a0f1a',
-          pointBorderWidth: 3,
-          pointRadius: 5,
-          pointHoverRadius: 8,
-          borderWidth: 3
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: true,
-        scales: {
-          x: {
-            grid: { color: 'rgba(255,255,255,0.04)' },
-            ticks: { color: '#6B7280', font: { family: 'Inter', size: 11 } }
-          },
-          y: {
-            beginAtZero: true,
-            grid: { color: 'rgba(255,255,255,0.04)' },
-            ticks: {
-              color: '#6B7280',
-              font: { family: 'Inter', size: 11 },
-              callback: (v) => v + 't'
-            }
-          }
-        },
-        plugins: {
-          legend: {
-            labels: {
-              color: '#9CA3AF',
-              font: { family: 'Inter', size: 11, weight: '600' },
-              usePointStyle: true
-            }
-          },
-          tooltip: {
-            backgroundColor: 'rgba(26,34,51,0.95)',
-            titleColor: '#F9FAFB',
-            bodyColor: '#9CA3AF',
-            titleFont: { family: 'Space Grotesk', weight: '700' },
-            bodyFont: { family: 'Inter' },
-            borderColor: 'rgba(16,185,129,0.3)',
+      this.charts.pie = new Chart(pieCtx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Transport', 'Home Energy', 'Diet & Waste'],
+          datasets: [{
+            data: [breakdown.transport, breakdown.energy, breakdown.dietLifestyle],
+            backgroundColor: [
+              '#3B82F6', // Blue for transport
+              '#F59E0B', // Amber for energy
+              '#10B981'  // Emerald for diet
+            ],
             borderWidth: 1,
-            cornerRadius: 12,
-            padding: 12
-          }
+            borderColor: 'rgba(255,255,255,0.08)'
+          }]
         },
-        animation: {
-          duration: 1000,
-          easing: 'easeOutQuart'
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: { color: '#9CA3AF', font: { family: 'Outfit', size: 11 } }
+            }
+          }
         }
-      }
-    });
-  }
-
-  function renderInsights(result) {
-    const grid = $('#insights-grid');
-    grid.innerHTML = '';
-
-    const insights = generateInsights(result);
-
-    insights.forEach(insight => {
-      const card = document.createElement('div');
-      card.className = 'insight-card';
-
-      const header = document.createElement('div');
-      header.className = 'insight-header';
-
-      const iconWrap = document.createElement('div');
-      iconWrap.className = 'insight-icon';
-      iconWrap.style.background = insight.bgColor;
-      iconWrap.style.color = insight.color;
-      const icon = document.createElement('i');
-      icon.setAttribute('data-lucide', insight.icon);
-      iconWrap.appendChild(icon);
-
-      const headerText = document.createElement('div');
-      const title = document.createElement('div');
-      title.className = 'insight-title';
-      title.textContent = insight.title;
-      headerText.appendChild(title);
-
-      if (insight.savings) {
-        const savings = document.createElement('span');
-        savings.className = 'insight-savings';
-        savings.textContent = insight.savings;
-        headerText.appendChild(savings);
-      }
-
-      header.appendChild(iconWrap);
-      header.appendChild(headerText);
-
-      const body = document.createElement('p');
-      body.className = 'insight-body';
-      body.textContent = insight.body;
-
-      card.appendChild(header);
-      card.appendChild(body);
-      grid.appendChild(card);
-    });
-
-    if (window.lucide) window.lucide.createIcons();
-  }
-
-  function generateInsights(result) {
-    const insights = [];
-
-    // Transport insights
-    if (result.transport > 3) {
-      insights.push({
-        icon: 'car', color: '#3B82F6', bgColor: 'rgba(59,130,246,0.15)',
-        title: 'Reduce Driving',
-        savings: 'Save up to ' + (result.transport * 0.3).toFixed(1) + 't',
-        body: 'Your transport emissions are significant. Consider carpooling, public transit, or an EV. Even cutting driving by 30% would save ' + (result.transport * 0.3).toFixed(1) + ' tonnes annually.'
       });
     }
 
-    if (result.breakdown && result.breakdown.flights > 1) {
-      insights.push({
-        icon: 'plane', color: '#3B82F6', bgColor: 'rgba(59,130,246,0.15)',
-        title: 'Fly Less',
-        savings: 'Save ' + result.breakdown.flights.toFixed(1) + 't',
-        body: 'Flying is your most carbon-intensive activity per hour. Consider trains for shorter trips and video calls for meetings.'
-      });
-    }
+    // 2. Line Chart - Reduction Timeline History
+    const lineCtx = document.getElementById('historyChart');
+    if (lineCtx) {
+      if (this.charts.line) this.charts.line.destroy();
 
-    // Energy insights
-    if (result.energy > 2) {
-      insights.push({
-        icon: 'zap', color: '#F59E0B', bgColor: 'rgba(245,158,11,0.15)',
-        title: 'Switch to Green Energy',
-        savings: 'Save up to ' + (result.energy * 0.8).toFixed(1) + 't',
-        body: 'Switching to a 100% renewable electricity tariff could eliminate up to 80% of your home energy emissions instantly.'
-      });
-    }
+      // Formulate timeline logs
+      let labels = [];
+      let data = [];
 
-    // Food insights
-    if (result.food > 2.5) {
-      insights.push({
-        icon: 'apple', color: '#10B981', bgColor: 'rgba(16,185,129,0.15)',
-        title: 'Shift Your Diet',
-        savings: 'Save up to ' + (result.food * 0.4).toFixed(1) + 't',
-        body: 'Reducing meat intake, especially beef, is one of the most impactful individual actions. Try plant-based meals 3 days a week.'
-      });
-    }
-
-    // Lifestyle insights
-    if (result.lifestyle > 1) {
-      insights.push({
-        icon: 'shopping-bag', color: '#8B5CF6', bgColor: 'rgba(139,92,246,0.15)',
-        title: 'Buy Less, Choose Well',
-        savings: 'Save up to ' + (result.lifestyle * 0.3).toFixed(1) + 't',
-        body: 'Extending the life of your electronics and clothes by even one year significantly reduces their embedded carbon.'
-      });
-    }
-
-    // Always show a positive general tip
-    insights.push({
-      icon: 'target', color: '#14B8A6', bgColor: 'rgba(20,184,166,0.15)',
-      title: 'Paris 2030 Target: 2.0t',
-      savings: result.total > 2 ? (result.total - 2).toFixed(1) + 't to go' : 'You\'re there!',
-      body: result.total > 2
-        ? 'You need to reduce by ' + (result.total - 2).toFixed(1) + ' tonnes to meet the Paris target. Use the Action Hub to start your pledges.'
-        : 'Amazing! You\'re already at or below the Paris 2030 per-capita target. Keep inspiring others!'
-    });
-
-    return insights;
-  }
-
-  /* ---- Action Hub ---- */
-
-  function renderActionHub() {
-    const state = AppState.get();
-
-    // Level info
-    const levelData = AppState.computeLevel(state.xp);
-    const nextXP = AppState.xpForNextLevel(state.xp);
-
-    $('#level-badge-lg').querySelector('span').textContent = levelData.level;
-    $('#level-title-text').textContent = levelData.title;
-    $('#xp-current').textContent = state.xp;
-    $('#xp-next').textContent = nextXP;
-
-    const xpPct = levelData.xpRequired === nextXP
-      ? 100
-      : ((state.xp - levelData.xpRequired) / (nextXP - levelData.xpRequired)) * 100;
-    $('#xp-bar').style.width = Math.min(xpPct, 100) + '%';
-
-    // Streak
-    $('#streak-number').textContent = state.streak;
-
-    // Badges
-    renderBadges();
-
-    // Challenges
-    renderChallenges();
-
-    // Update header
-    updateHeaderStats();
-  }
-
-  function renderBadges() {
-    const grid = $('#badges-grid');
-    grid.innerHTML = '';
-    const state = AppState.get();
-
-    CarbonDatabase.BADGES.forEach(badge => {
-      const isUnlocked = state.unlockedBadges.includes(badge.id);
-
-      const item = document.createElement('div');
-      item.className = 'badge-item ' + (isUnlocked ? 'unlocked' : 'locked');
-
-      const emoji = document.createElement('div');
-      emoji.className = 'badge-emoji';
-      emoji.textContent = badge.emoji;
-      emoji.setAttribute('aria-hidden', 'true');
-
-      const name = document.createElement('div');
-      name.className = 'badge-name';
-      name.textContent = badge.name;
-
-      const desc = document.createElement('div');
-      desc.className = 'badge-desc';
-      desc.textContent = isUnlocked ? '✓ Unlocked' : badge.desc;
-
-      item.appendChild(emoji);
-      item.appendChild(name);
-      item.appendChild(desc);
-      grid.appendChild(item);
-    });
-  }
-
-  function renderChallenges() {
-    const list = $('#challenges-list');
-    list.innerHTML = '';
-    const state = AppState.get();
-
-    let activeCount = 0;
-
-    CarbonDatabase.CHALLENGES.forEach(ch => {
-      const isActive = state.activePledges.includes(ch.id);
-      const isCompleted = state.completedChallenges.includes(ch.id);
-      if (isActive) activeCount++;
-
-      const card = document.createElement('div');
-      card.className = 'challenge-card';
-      if (isActive) card.classList.add('active-pledge');
-      if (isCompleted && !isActive) card.classList.add('completed-pledge');
-
-      const iconEl = document.createElement('div');
-      iconEl.className = 'challenge-icon';
-      iconEl.textContent = ch.emoji;
-      iconEl.setAttribute('aria-hidden', 'true');
-
-      const info = document.createElement('div');
-      info.className = 'challenge-info';
-
-      const title = document.createElement('div');
-      title.className = 'challenge-title';
-      title.textContent = ch.title;
-
-      const desc = document.createElement('div');
-      desc.className = 'challenge-desc';
-      desc.textContent = ch.desc;
-
-      const meta = document.createElement('div');
-      meta.className = 'challenge-meta';
-
-      const xpBadge = document.createElement('span');
-      xpBadge.className = 'challenge-xp';
-      xpBadge.textContent = '+' + ch.xp + ' XP';
-
-      const reduction = document.createElement('span');
-      reduction.className = 'challenge-reduction';
-      reduction.textContent = '↓ ' + ch.reduction;
-
-      meta.appendChild(xpBadge);
-      meta.appendChild(reduction);
-      info.appendChild(title);
-      info.appendChild(desc);
-      info.appendChild(meta);
-
-      const actions = document.createElement('div');
-      actions.className = 'challenge-actions';
-
-      if (isCompleted && !isActive) {
-        const doneBtn = document.createElement('button');
-        doneBtn.className = 'btn btn-ghost btn-sm';
-        doneBtn.textContent = '✓ Done';
-        doneBtn.disabled = true;
-        actions.appendChild(doneBtn);
-      } else if (isActive) {
-        const completeBtn = document.createElement('button');
-        completeBtn.className = 'btn btn-primary btn-sm';
-        completeBtn.textContent = 'Complete ✓';
-        completeBtn.addEventListener('click', () => completeChallenge(ch));
-        actions.appendChild(completeBtn);
-
-        const cancelBtn = document.createElement('button');
-        cancelBtn.className = 'btn btn-ghost btn-sm';
-        cancelBtn.textContent = 'Drop';
-        cancelBtn.addEventListener('click', () => dropChallenge(ch.id));
-        actions.appendChild(cancelBtn);
+      if (AppState.data.history.length === 0) {
+        // Populate static visual demo trend line if no audits recorded
+        labels = ['Initial Audit', 'Pledge Phase 1', 'Offset Lock'];
+        data = [breakdown.total, breakdown.total * 0.9, Math.max(0, breakdown.total - AppState.data.lockedOffsets)];
       } else {
-        const pledgeBtn = document.createElement('button');
-        pledgeBtn.className = 'btn btn-primary btn-sm';
-        pledgeBtn.textContent = 'Pledge';
-        pledgeBtn.addEventListener('click', () => activateChallenge(ch.id));
-        actions.appendChild(pledgeBtn);
+        // Display user audits
+        AppState.data.history.forEach((h, index) => {
+          labels.push(h.date || `Audit #${index + 1}`);
+          data.push(h.total);
+        });
       }
 
-      card.appendChild(iconEl);
-      card.appendChild(info);
-      card.appendChild(actions);
-      list.appendChild(card);
-    });
-
-    $('#active-challenge-count').textContent = activeCount + ' active';
-  }
-
-  function activateChallenge(id) {
-    const state = AppState.get();
-    if (!state.activePledges.includes(id)) {
-      state.activePledges.push(id);
-      AppState.update({ activePledges: state.activePledges });
-    }
-    renderChallenges();
-    updateHeaderStats();
-  }
-
-  function dropChallenge(id) {
-    const state = AppState.get();
-    AppState.update({
-      activePledges: state.activePledges.filter(p => p !== id)
-    });
-    renderChallenges();
-  }
-
-  function completeChallenge(challenge) {
-    const state = AppState.get();
-    const newXP = state.xp + challenge.xp;
-    const oldLevel = AppState.computeLevel(state.xp);
-    const newLevel = AppState.computeLevel(newXP);
-
-    // Update streak
-    const today = new Date().toISOString().split('T')[0];
-    let newStreak = state.streak;
-    if (state.lastCheckInDate !== today) {
-      // Check if yesterday was the last check-in
-      const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-      newStreak = (state.lastCheckInDate === yesterday) ? state.streak + 1 : 1;
-    }
-
-    const completed = [...state.completedChallenges];
-    if (!completed.includes(challenge.id)) {
-      completed.push(challenge.id);
-    }
-
-    AppState.update({
-      xp: newXP,
-      level: newLevel.level,
-      streak: newStreak,
-      lastCheckInDate: today,
-      activePledges: state.activePledges.filter(p => p !== challenge.id),
-      completedChallenges: completed
-    });
-
-    // Re-render
-    renderActionHub();
-
-    // Level up?
-    if (newLevel.level > oldLevel.level) {
-      showLevelUpModal(newLevel);
-    }
-
-    // Check badges
-    checkBadges();
-  }
-
-  function checkBadges() {
-    const state = AppState.get();
-    let newBadgeUnlocked = null;
-
-    CarbonDatabase.BADGES.forEach(badge => {
-      if (!state.unlockedBadges.includes(badge.id) && badge.condition(state)) {
-        state.unlockedBadges.push(badge.id);
-        newBadgeUnlocked = badge;
-      }
-    });
-
-    if (newBadgeUnlocked) {
-      AppState.update({ unlockedBadges: state.unlockedBadges });
-      renderBadges();
-      showBadgeModal(newBadgeUnlocked);
-    }
-  }
-
-  function updateHeaderStats() {
-    const state = AppState.get();
-    $('#header-streak').textContent = state.streak;
-    $('#header-xp').textContent = state.xp;
-    $('#header-level').textContent = AppState.computeLevel(state.xp).level;
-  }
-
-  /* ---- Modals ---- */
-
-  function showLevelUpModal(levelData) {
-    $('#levelup-text').textContent =
-      'You reached Level ' + levelData.level + ' — ' + levelData.title + '! Keep up the amazing eco-efforts!';
-    openModal('levelup-modal');
-  }
-
-  function showBadgeModal(badge) {
-    $('#badge-modal-icon').textContent = badge.emoji;
-    $('#badge-modal-title').textContent = 'Badge Unlocked!';
-    $('#badge-modal-text').textContent = badge.name + ' — ' + badge.desc;
-    // Delay slightly if level-up is showing
-    setTimeout(() => openModal('badge-modal'), 600);
-  }
-
-  function openModal(id) {
-    const modal = $('#' + id);
-    modal.removeAttribute('hidden');
-    // Focus the close button
-    const closeBtn = modal.querySelector('.btn');
-    if (closeBtn) setTimeout(() => closeBtn.focus(), 100);
-  }
-
-  function closeModal(id) {
-    const modal = $('#' + id);
-    if (modal) modal.setAttribute('hidden', '');
-  }
-
-  /* ---- Tab Switching ---- */
-
-  function switchTab(tabName) {
-    $$('.tab-btn').forEach(btn => {
-      const isActive = btn.dataset.tab === tabName;
-      btn.classList.toggle('active', isActive);
-      btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
-    });
-
-    $$('.tab-panel').forEach(panel => {
-      panel.classList.toggle('active', panel.id === 'tab-' + tabName);
-    });
-  }
-
-  /* ---- Simulate Progress ---- */
-
-  function simulateProgress() {
-    const state = AppState.get();
-    if (!state.results) return;
-
-    const currentTotal = state.results.total;
-    const history = [...state.history];
-
-    // Generate 5 simulated future entries with gradual reduction
-    for (let i = 1; i <= 5; i++) {
-      const date = new Date();
-      date.setMonth(date.getMonth() + i);
-      const reduction = 1 - (i * 0.06); // 6% reduction per month
-      history.push({
-        date: date.toISOString().split('T')[0],
-        total: Math.max(currentTotal * reduction, 0.5).toFixed(2) * 1,
-        transport: (state.results.transport * reduction).toFixed(2) * 1,
-        energy: (state.results.energy * reduction).toFixed(2) * 1,
-        food: (state.results.food * reduction).toFixed(2) * 1,
-        lifestyle: (state.results.lifestyle * reduction).toFixed(2) * 1
+      this.charts.line = new Chart(lineCtx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'CO₂e Footprint (tonnes)',
+            data: data,
+            borderColor: '#34D399',
+            backgroundColor: 'rgba(52, 211, 153, 0.05)',
+            fill: true,
+            tension: 0.3,
+            borderWidth: 2,
+            pointBackgroundColor: '#10B981'
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            y: {
+              grid: { color: 'rgba(255,255,255,0.03)' },
+              ticks: { color: '#9CA3AF', font: { family: 'Outfit' } }
+            },
+            x: {
+              grid: { display: false },
+              ticks: { color: '#9CA3AF', font: { family: 'Outfit' } }
+            }
+          },
+          plugins: {
+            legend: { display: false }
+          }
+        }
       });
     }
+  },
 
-    // Keep last 20
-    while (history.length > 20) history.shift();
+  triggerConfetti: function() {
+    if (window.confetti) {
+      window.confetti({
+        particleCount: 80,
+        spread: 60,
+        origin: { y: 0.75 },
+        colors: ['#10B981', '#34D399', '#059669', '#3B82F6']
+      });
+    }
+  },
 
-    AppState.update({ history });
-    renderLineChart();
+  triggerLevelUpCelebration: function(newLevelName) {
+    this.triggerConfetti();
+    
+    const levelModal = document.getElementById('levelup-modal');
+    const nameDisplay = document.getElementById('new-level-name-display');
+    
+    if (nameDisplay) nameDisplay.textContent = `Level ${AppState.data.level} ${newLevelName}`;
+    if (levelModal) levelModal.classList.add('active');
+
+    // Focus level modal for screen readers
+    levelModal.setAttribute('tabindex', '-1');
+    levelModal.focus();
+  },
+
+  closeLevelUpModal: function() {
+    const levelModal = document.getElementById('levelup-modal');
+    if (levelModal) levelModal.classList.remove('active');
   }
+};
 
-  /* ---- Carbon Search ---- */
+// ==========================================
+// 5. Onboarding Calculator Wizard
+// ==========================================
+const CalculatorWizard = {
+  currentStep: 1,
+  totalSteps: 4,
 
-  function performCarbonSearch() {
-    const query = $('#carbon-search-input').value.trim().toLowerCase();
-    const resultsEl = $('#search-results');
-    resultsEl.innerHTML = '';
+  openModal: function() {
+    const modal = document.getElementById('calculator-modal');
+    if (modal) {
+      modal.classList.add('active');
+      modal.focus();
+    }
+    
+    this.currentStep = 1;
+    this.updateWizardStepUI();
+    this.registerSliderListeners();
+    this.calculateLiveValues();
+  },
 
-    if (!query) return;
+  closeModal: function() {
+    const modal = document.getElementById('calculator-modal');
+    if (modal) modal.classList.remove('active');
+  },
 
-    // Update search count for badge
-    const state = AppState.get();
-    AppState.update({ searchCount: state.searchCount + 1 });
-    checkBadges();
+  registerSliderListeners: function() {
+    // Distance
+    const distSlider = document.getElementById('input-distance');
+    if (distSlider) {
+      distSlider.oninput = (e) => {
+        document.getElementById('badge-distance').textContent = `${e.target.value} miles`;
+        this.calculateLiveValues();
+      };
+    }
+    
+    // Transit
+    const transitSlider = document.getElementById('input-transit');
+    if (transitSlider) {
+      transitSlider.oninput = (e) => {
+        document.getElementById('badge-transit').textContent = `${e.target.value} hours`;
+        this.calculateLiveValues();
+      };
+    }
 
-    // Search items
-    const matches = CarbonDatabase.ITEMS.filter(item =>
-      item.name.toLowerCase().includes(query) ||
-      item.desc.toLowerCase().includes(query)
-    );
+    // Flights
+    const flightSlider = document.getElementById('input-flights');
+    if (flightSlider) {
+      flightSlider.oninput = (e) => {
+        document.getElementById('badge-flights').textContent = `${e.target.value} flights`;
+        this.calculateLiveValues();
+      };
+    }
 
-    if (matches.length === 0) {
-      const noResult = document.createElement('div');
-      noResult.className = 'search-no-result';
-      noResult.textContent = 'No results found for "' + query + '". Try searching for common items like "coffee", "jeans", or "flight".';
-      resultsEl.appendChild(noResult);
+    // Electricity
+    const elecSlider = document.getElementById('input-electricity');
+    if (elecSlider) {
+      elecSlider.oninput = (e) => {
+        document.getElementById('badge-electricity').textContent = `$${e.target.value}`;
+        this.calculateLiveValues();
+      };
+    }
+
+    // Gas
+    const gasSlider = document.getElementById('input-gas');
+    if (gasSlider) {
+      gasSlider.oninput = (e) => {
+        document.getElementById('badge-gas').textContent = `$${e.target.value}`;
+        this.calculateLiveValues();
+      };
+    }
+
+    // Green power
+    const greenSlider = document.getElementById('input-green');
+    if (greenSlider) {
+      greenSlider.oninput = (e) => {
+        document.getElementById('badge-green').textContent = `${e.target.value}%`;
+        this.calculateLiveValues();
+      };
+    }
+
+    // Shopping
+    const shopSlider = document.getElementById('input-shopping');
+    if (shopSlider) {
+      const shopLabels = { 1: 'Minimal Sourcing', 2: 'Average Sourcing', 3: 'Frequent Sourcing', 4: 'Heavy Consumption' };
+      shopSlider.oninput = (e) => {
+        document.getElementById('badge-shopping').textContent = shopLabels[e.target.value];
+        this.calculateLiveValues();
+      };
+    }
+
+    // Food Waste
+    const wasteSlider = document.getElementById('input-foodwaste');
+    if (wasteSlider) {
+      const wasteLabels = { 1: 'Near Zero / Compost', 2: 'Average Waste', 3: 'High Food Disposal' };
+      wasteSlider.oninput = (e) => {
+        document.getElementById('badge-foodwaste').textContent = wasteLabels[e.target.value];
+        this.calculateLiveValues();
+      };
+    }
+  },
+
+  updateVehicleLabel: function(label) {
+    document.getElementById('badge-vehicle-type').textContent = label;
+    // Visually toggle classes inside card grid
+    const cards = document.querySelectorAll('#step-panel-1 .form-select-card');
+    cards.forEach(c => c.classList.remove('selected'));
+    
+    const mapping = {
+      'Petrol': 'lbl-vehicle-petrol',
+      'Diesel': 'lbl-vehicle-diesel',
+      'Electric (EV)': 'lbl-vehicle-electric',
+      'No Car / Bike': 'lbl-vehicle-none'
+    };
+    const el = document.getElementById(mapping[label]);
+    if (el) el.classList.add('selected');
+    
+    // Toggle distance inputs if user has no car
+    const distGrp = document.getElementById('group-distance');
+    if (distGrp) {
+      if (label === 'No Car / Bike') {
+        distGrp.style.display = 'none';
+      } else {
+        distGrp.style.display = 'flex';
+      }
+    }
+    
+    this.calculateLiveValues();
+  },
+
+  updateDietLabel: function(label) {
+    document.getElementById('badge-diet-type').textContent = label;
+    const cards = document.querySelectorAll('#step-panel-3 .form-select-card');
+    cards.forEach(c => c.classList.remove('selected'));
+
+    const mapping = {
+      'Average/Mixed': 'lbl-diet-mixed',
+      'Low-Meat / Veggie': 'lbl-diet-meatless',
+      'Vegetarian': 'lbl-diet-veg',
+      'Strict Vegan': 'lbl-diet-vegan'
+    };
+    const el = document.getElementById(mapping[label]);
+    if (el) el.classList.add('selected');
+    
+    this.calculateLiveValues();
+  },
+
+  updateSortingLabel: function(label) {
+    document.getElementById('badge-sorting-level').textContent = label;
+    const cards = document.querySelectorAll('#step-panel-4 .form-select-card');
+    cards.forEach(c => c.classList.remove('selected'));
+
+    const mapping = {
+      'No Recycling': 'lbl-sorting-none',
+      'Partial Sorting': 'lbl-sorting-partial',
+      'Thorough Sorting': 'lbl-sorting-strict'
+    };
+    const el = document.getElementById(mapping[label]);
+    if (el) el.classList.add('selected');
+
+    this.calculateLiveValues();
+  },
+
+  gatherInputs: function() {
+    // Extract values
+    const vehicleEl = document.querySelector('input[name="vehicleType"]:checked');
+    const dietEl = document.querySelector('input[name="dietType"]:checked');
+    const sortEl = document.querySelector('input[name="sortingLevel"]:checked');
+
+    return {
+      vehicleType: vehicleEl ? vehicleEl.value : 'petrol',
+      distance: document.getElementById('input-distance').value,
+      transit: document.getElementById('input-transit').value,
+      flights: document.getElementById('input-flights').value,
+      electricity: document.getElementById('input-electricity').value,
+      gas: document.getElementById('input-gas').value,
+      greenPercent: document.getElementById('input-green').value,
+      dietType: dietEl ? dietEl.value : 'mixed',
+      shopping: document.getElementById('input-shopping').value,
+      foodwaste: document.getElementById('input-foodwaste').value,
+      sortingLevel: sortEl ? sortEl.value : 'partial'
+    };
+  },
+
+  calculateLiveValues: function() {
+    const inputs = this.gatherInputs();
+    const result = CarbonCalculator.calculate(inputs);
+    document.getElementById('calc-live-val').textContent = result.total.toFixed(1);
+  },
+
+  changeStep: function(direction) {
+    const next = this.currentStep + direction;
+    
+    if (next > this.totalSteps) {
+      this.finishAudit();
       return;
     }
 
-    matches.forEach(item => {
-      const el = document.createElement('div');
-      el.className = 'search-result-item';
+    if (next >= 1 && next <= this.totalSteps) {
+      this.currentStep = next;
+      this.updateWizardStepUI();
+    }
+  },
 
-      const icon = document.createElement('div');
-      icon.className = 'search-result-icon';
-      icon.textContent = item.icon;
-      icon.setAttribute('aria-hidden', 'true');
+  updateWizardStepUI: function() {
+    // Nodes active
+    for (let i = 1; i <= this.totalSteps; i++) {
+      const node = document.getElementById(`step-node-1`); // visual check
+      const currentEl = document.getElementById(`step-node-${i}`);
+      const panelEl = document.getElementById(`step-panel-${i}`);
+      
+      if (currentEl) {
+        if (i < this.currentStep) {
+          currentEl.className = 'calc-step-node completed';
+          currentEl.setAttribute('aria-current', 'false');
+        } else if (i === this.currentStep) {
+          currentEl.className = 'calc-step-node active';
+          currentEl.setAttribute('aria-current', 'step');
+        } else {
+          currentEl.className = 'calc-step-node';
+          currentEl.setAttribute('aria-current', 'false');
+        }
+      }
 
-      const info = document.createElement('div');
-      info.className = 'search-result-info';
+      if (panelEl) {
+        if (i === this.currentStep) {
+          panelEl.classList.add('active');
+        } else {
+          panelEl.classList.remove('active');
+        }
+      }
+    }
 
-      const name = document.createElement('div');
-      name.className = 'search-result-name';
-      name.textContent = item.name;
+    // Step bar progress line
+    const progressWidth = ((this.currentStep - 1) / (this.totalSteps - 1)) * 100;
+    document.getElementById('step-bar-fill').style.width = `${progressWidth}%`;
 
-      const desc = document.createElement('div');
-      desc.className = 'search-result-desc';
-      desc.textContent = item.desc + ' · ' + item.unit;
+    // Buttons control
+    const prevBtn = document.getElementById('prev-step-btn');
+    const nextBtn = document.getElementById('next-step-btn');
 
-      info.appendChild(name);
-      info.appendChild(desc);
+    if (this.currentStep === 1) {
+      prevBtn.setAttribute('disabled', 'true');
+    } else {
+      prevBtn.removeAttribute('disabled');
+    }
 
-      const co2 = document.createElement('div');
-      co2.className = 'search-result-co2';
-      co2.textContent = formatCO2(item.co2);
+    if (this.currentStep === this.totalSteps) {
+      nextBtn.textContent = 'Submit';
+    } else {
+      nextBtn.textContent = 'Next';
+    }
+  },
 
-      el.appendChild(icon);
-      el.appendChild(info);
-      el.appendChild(co2);
-      resultsEl.appendChild(el);
+  finishAudit: function() {
+    const inputs = this.gatherInputs();
+    const result = CarbonCalculator.calculate(inputs);
+    
+    // Save state
+    AppState.data.inputs = inputs;
+    AppState.data.breakdown = result;
+    AppState.data.hasCalculated = true;
+    
+    // Add to history
+    const dateStr = new Date().toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+    AppState.data.history.push({
+      date: dateStr,
+      total: result.total
     });
+
+    // Award initial XP
+    const isLevelUp = AppState.data.xp === 0 ? AppState.addXP(100) : AppState.addXP(25);
+    AppState.save();
+
+    // Close and load dashboard
+    this.closeModal();
+    
+    // Hide initial welcome screen if visible
+    const welcomeSection = document.getElementById('panel-welcome');
+    if (welcomeSection) welcomeSection.classList.remove('active');
+
+    App.updateUserProgressUI();
+    App.switchPanel('dashboard');
+
+    if (isLevelUp) {
+      App.triggerLevelUpCelebration(AppState.data.levelName);
+    } else {
+      App.triggerConfetti();
+    }
+    
+    // Re-render achievements
+    PledgeManager.renderBadges();
+  },
+
+  loadMockAverage: function() {
+    // Direct Mock for ease of verification/mock
+    const mockBreakdown = {
+      transport: 5.6,
+      energy: 4.8,
+      dietLifestyle: 3.4,
+      total: 13.8
+    };
+
+    AppState.data.inputs = {
+      vehicleType: 'petrol',
+      distance: 220,
+      transit: 2,
+      flights: 1,
+      electricity: 120,
+      gas: 60,
+      greenPercent: 10,
+      dietType: 'mixed',
+      shopping: 2,
+      foodwaste: 2,
+      sortingLevel: 'partial'
+    };
+    AppState.data.breakdown = mockBreakdown;
+    AppState.data.hasCalculated = true;
+    
+    const dateStr = new Date().toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+    AppState.data.history = [{ date: dateStr, total: 13.8 }];
+    
+    AppState.addXP(100);
+    AppState.save();
+
+    const welcomeSection = document.getElementById('panel-welcome');
+    if (welcomeSection) welcomeSection.classList.remove('active');
+
+    App.updateUserProgressUI();
+    App.switchPanel('dashboard');
+    App.triggerConfetti();
+    PledgeManager.renderBadges();
   }
+};
 
-  function formatCO2(kg) {
-    if (kg >= 1000) return (kg / 1000).toFixed(1) + 't';
-    if (kg >= 1) return kg.toFixed(1) + ' kg';
-    return (kg * 1000).toFixed(0) + ' g';
-  }
+// ==========================================
+// 6. Action Hub Pledge Manager
+// ==========================================
+const PledgeManager = {
+  currentCategoryFilter: 'all',
 
-  /* ---- Learn Tab ---- */
+  filterCategory: function(cat) {
+    this.currentCategoryFilter = cat;
+    
+    // Toggle active tab buttons
+    const btns = document.querySelectorAll('.pledges-category-tabs .tab-btn');
+    btns.forEach(b => b.classList.remove('active'));
+    
+    const activeBtn = document.getElementById(`tab-${cat}`);
+    if (activeBtn) activeBtn.classList.add('active');
+    
+    this.renderPledges();
+  },
 
-  function renderLearnTab() {
-    const accordion = $('#tips-accordion');
-    accordion.innerHTML = '';
+  renderPledges: function() {
+    const list = document.getElementById('pledges-list-container');
+    if (!list) return;
 
-    CarbonDatabase.TIPS.forEach((tip, index) => {
-      const item = document.createElement('div');
-      item.className = 'tip-item';
+    // Securely clear list
+    list.textContent = '';
 
-      const header = document.createElement('button');
-      header.className = 'tip-header';
-      header.setAttribute('aria-expanded', 'false');
-      header.setAttribute('aria-controls', 'tip-body-' + index);
-      header.id = 'tip-header-' + index;
+    const filtered = PledgeLibrary.filter(p => {
+      if (this.currentCategoryFilter === 'all') return true;
+      return p.category === this.currentCategoryFilter;
+    });
 
-      const emoji = document.createElement('span');
-      emoji.className = 'tip-emoji';
-      emoji.textContent = tip.emoji;
+    filtered.forEach(p => {
+      const isCommitted = AppState.data.pledges.includes(p.id);
+      const isDoneToday = AppState.data.completedToday.includes(p.id);
+
+      // Card element XSS-safe construction
+      const card = document.createElement('div');
+      card.className = `pledge-item-card ${isCommitted ? 'pledged' : ''}`;
+      card.setAttribute('role', 'listitem');
+
+      const infoDiv = document.createElement('div');
+      infoDiv.className = 'pledge-item-info';
+
+      // Checkbox container
+      const chkContainer = document.createElement('div');
+      chkContainer.className = 'pledge-checkbox-container';
+
+      const chkInput = document.createElement('input');
+      chkInput.type = 'checkbox';
+      chkInput.ariaLabel = `Complete pledge ${p.title}`;
+      chkInput.checked = isDoneToday;
+      chkInput.disabled = !isCommitted; // must join pledge first
+      chkInput.onchange = (e) => this.togglePledgeCompletion(p.id, e.target.checked);
+
+      const checkmarkSpan = document.createElement('span');
+      checkmarkSpan.className = 'checkmark';
+      const checkI = document.createElement('i');
+      checkI.setAttribute('data-lucide', 'check');
+      checkI.style.width = '14px';
+      checkI.style.height = '14px';
+      checkmarkSpan.appendChild(checkI);
+
+      chkContainer.appendChild(chkInput);
+      chkContainer.appendChild(checkmarkSpan);
+      infoDiv.appendChild(chkContainer);
+
+      // Text detail
+      const details = document.createElement('div');
+      details.className = 'pledge-details';
 
       const title = document.createElement('span');
-      title.className = 'tip-title';
-      title.textContent = tip.title;
+      title.className = 'pledge-title';
+      title.textContent = p.title;
 
-      const category = document.createElement('span');
-      category.className = 'tip-category';
-      category.textContent = tip.category;
-      category.style.background = tip.categoryColor + '22';
-      category.style.color = tip.categoryColor;
+      const meta = document.createElement('div');
+      meta.className = 'pledge-meta';
 
-      const chevron = document.createElement('span');
-      chevron.className = 'tip-chevron';
-      chevron.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>';
+      const co2Span = document.createElement('span');
+      co2Span.className = 'pledge-co2-save';
+      co2Span.textContent = `-${p.co2} kg CO₂/day`;
 
-      header.appendChild(emoji);
+      const xpSpan = document.createElement('span');
+      xpSpan.className = 'pledge-xp-gain';
+      xpSpan.textContent = `+${p.xp} XP`;
+
+      const desc = document.createElement('p');
+      desc.style.fontSize = '0.75rem';
+      desc.style.color = 'var(--text-muted)';
+      desc.style.marginTop = '4px';
+      desc.textContent = p.desc;
+
+      meta.appendChild(co2Span);
+      meta.appendChild(xpSpan);
+      details.appendChild(title);
+      details.appendChild(meta);
+      details.appendChild(desc);
+      infoDiv.appendChild(details);
+
+      card.appendChild(infoDiv);
+
+      // Join/Quit Button
+      const actBtn = document.createElement('button');
+      actBtn.type = 'button';
+      actBtn.className = 'pledge-btn';
+      actBtn.textContent = isCommitted ? 'Release' : 'Pledge';
+      actBtn.onclick = () => this.togglePledgeCommitment(p.id);
+      
+      card.appendChild(actBtn);
+      list.appendChild(card);
+    });
+
+    // Refresh icons
+    if (window.lucide) window.lucide.createIcons();
+  },
+
+  togglePledgeCommitment: function(pid) {
+    const list = AppState.data.pledges;
+    const index = list.indexOf(pid);
+
+    if (index === -1) {
+      list.push(pid);
+      AppState.addXP(10); // small XP award for taking on a commitment
+    } else {
+      list.splice(index, 1);
+      // Remove from completed if released
+      const compIndex = AppState.data.completedToday.indexOf(pid);
+      if (compIndex !== -1) AppState.data.completedToday.splice(compIndex, 1);
+    }
+    
+    AppState.save();
+    App.updateUserProgressUI();
+    this.renderPledges();
+    this.renderBadges();
+  },
+
+  togglePledgeCompletion: function(pid, isChecked) {
+    const comp = AppState.data.completedToday;
+    const pledgeItem = PledgeLibrary.find(x => x.id === pid);
+    if (!pledgeItem) return;
+
+    const index = comp.indexOf(pid);
+
+    if (isChecked && index === -1) {
+      comp.push(pid);
+      App.incrementStreak();
+      const levelUp = AppState.addXP(pledgeItem.xp);
+      
+      if (levelUp) {
+        App.triggerLevelUpCelebration(AppState.data.levelName);
+      } else {
+        App.triggerConfetti();
+      }
+    } else if (!isChecked && index !== -1) {
+      comp.splice(index, 1);
+      AppState.data.xp = Math.max(0, AppState.data.xp - pledgeItem.xp);
+      AppState.save();
+    }
+
+    AppState.save();
+    App.updateUserProgressUI();
+    this.renderBadges();
+  },
+
+  renderBadges: function() {
+    const container = document.getElementById('badges-container');
+    if (!container) return;
+
+    // Securely clear container
+    container.textContent = '';
+
+    BadgesLibrary.forEach(b => {
+      const isUnlocked = b.requirement(AppState.data);
+
+      const card = document.createElement('article');
+      card.className = `badge-item-card ${isUnlocked ? 'unlocked' : ''}`;
+
+      const iconDiv = document.createElement('div');
+      iconDiv.className = 'badge-icon';
+      const badgeI = document.createElement('i');
+      badgeI.setAttribute('data-lucide', 'shield');
+      iconDiv.appendChild(badgeI);
+
+      const name = document.createElement('span');
+      name.className = 'badge-name';
+      name.textContent = b.title;
+
+      const desc = document.createElement('p');
+      desc.className = 'badge-desc';
+      desc.textContent = b.desc;
+
+      card.appendChild(iconDiv);
+      card.appendChild(name);
+      card.appendChild(desc);
+      container.appendChild(card);
+    });
+
+    if (window.lucide) window.lucide.createIcons();
+  }
+};
+
+// ==========================================
+// 7. Carbon Footprint Search Engine
+// ==========================================
+const SearchEngine = {
+  init: function() {
+    const input = document.getElementById('footprint-search-input');
+    if (input) {
+      input.addEventListener('input', (e) => this.handleSearch(e.target.value));
+    }
+  },
+
+  handleSearch: function(query) {
+    const container = document.getElementById('search-results-container');
+    if (!container) return;
+
+    const cleanQuery = query.toLowerCase().trim();
+
+    if (cleanQuery.length === 0) {
+      container.textContent = '';
+      const placeholder = document.createElement('p');
+      placeholder.style.textAlign = 'center';
+      placeholder.style.color = 'var(--text-muted)';
+      placeholder.style.fontSize = '0.85rem';
+      placeholder.style.padding = '24px 0';
+      placeholder.textContent = 'Try searching for "beef", "bagel", "avocado", "t-shirt", "laptop", or "plastic bag".';
+      container.appendChild(placeholder);
+      return;
+    }
+
+    // Securely clear container
+    container.textContent = '';
+
+    // Search keys
+    const keys = Object.keys(FoodprintIndex);
+    const matches = keys.filter(k => k.includes(cleanQuery));
+
+    if (matches.length === 0) {
+      const noResult = document.createElement('p');
+      noResult.style.textAlign = 'center';
+      noResult.style.color = 'var(--text-muted)';
+      noResult.style.fontSize = '0.85rem';
+      noResult.style.padding = '24px 0';
+      noResult.textContent = 'No matching items found. Try different keywords.';
+      container.appendChild(noResult);
+      return;
+    }
+
+    // Build lists XSS-safe
+    matches.forEach(m => {
+      const item = FoodprintIndex[m];
+      
+      const card = document.createElement('div');
+      card.className = 'search-item-card';
+
+      const detailsDiv = document.createElement('div');
+      detailsDiv.style.display = 'flex';
+      detailsDiv.style.flexDirection = 'column';
+      detailsDiv.style.gap = '4px';
+
+      const name = document.createElement('span');
+      name.className = 'search-item-name';
+      name.style.textTransform = 'capitalize';
+      name.textContent = m;
+
+      const desc = document.createElement('p');
+      desc.style.fontSize = '0.75rem';
+      desc.style.color = 'var(--text-muted)';
+      desc.textContent = item.desc;
+
+      detailsDiv.appendChild(name);
+      detailsDiv.appendChild(desc);
+
+      const val = document.createElement('span');
+      val.className = 'search-item-val';
+      val.textContent = `${item.val} kg`;
+
+      card.appendChild(detailsDiv);
+      card.appendChild(val);
+      container.appendChild(card);
+    });
+  }
+};
+
+// ==========================================
+// 8. Offset Simulator Engine
+// ==========================================
+const OffsetSimulator = {
+  init: function() {
+    const slTrees = document.getElementById('slider-trees');
+    const slSolar = document.getElementById('slider-solar');
+    const slCredits = document.getElementById('slider-credits');
+
+    if (slTrees) slTrees.oninput = (e) => this.handleUpdate();
+    if (slSolar) slSolar.oninput = (e) => this.handleUpdate();
+    if (slCredits) slCredits.oninput = (e) => this.handleUpdate();
+
+    this.handleUpdate();
+  },
+
+  handleUpdate: function() {
+    const trees = Number(document.getElementById('slider-trees').value) || 0;
+    const solar = Number(document.getElementById('slider-solar').value) || 0;
+    const credits = Number(document.getElementById('slider-credits').value) || 0;
+
+    // Badges update
+    document.getElementById('badge-trees').textContent = `${trees} trees`;
+    document.getElementById('badge-solar').textContent = `${solar.toLocaleString()} kWh`;
+    document.getElementById('badge-credits').textContent = `$${credits} USD`;
+
+    // Calculation CO2 mitigation in tonnes:
+    // Tree = 22kg CO2/year -> 0.022 tonnes
+    const treeAbsorb = (trees * 22) / 1000;
+    // Solar displacing grid = 0.45kg CO2/kWh -> 0.00045 tonnes
+    const solarDisplace = (solar * 0.45) / 1000;
+    // Direct Credits = $200 per tonne -> 1 tonne per $200
+    const directCredits = credits / 200;
+
+    const totalSimulated = treeAbsorb + solarDisplace + directCredits;
+    const totalEmissions = AppState.data.breakdown.total;
+
+    let percent = 0;
+    if (totalEmissions > 0) {
+      percent = Math.min(100, Math.floor((totalSimulated / totalEmissions) * 100));
+    }
+    const remaining = Math.max(0, totalEmissions - totalSimulated);
+
+    // Save simulation temporary values to AppState
+    AppState.data.simulatedOffsets = { trees, solar, credits };
+
+    // Update screen components
+    document.getElementById('offset-amount-display').textContent = totalSimulated.toFixed(3);
+    document.getElementById('offset-percent-display').textContent = `${percent}%`;
+    document.getElementById('offset-remaining-display').textContent = remaining.toFixed(1);
+  },
+
+  applySimulatedOffsets: function() {
+    // Mitigate remaining footprint by locking simulated offsets
+    const trees = AppState.data.simulatedOffsets.trees;
+    const solar = AppState.data.simulatedOffsets.solar;
+    const credits = AppState.data.simulatedOffsets.credits;
+
+    const totalOffsetTonnes = ((trees * 22) + (solar * 0.45)) / 1000 + (credits / 200);
+
+    if (totalOffsetTonnes <= 0) return;
+
+    AppState.data.lockedOffsets += parseFloat(totalOffsetTonnes.toFixed(3));
+    
+    // Reward XP
+    const pointsAwarded = Math.min(100, Math.floor(totalOffsetTonnes * 10)); // max 100 XP
+    const levelUp = AppState.addXP(pointsAwarded);
+
+    // Reset sliders
+    document.getElementById('slider-trees').value = 0;
+    document.getElementById('slider-solar').value = 0;
+    document.getElementById('slider-credits').value = 0;
+
+    AppState.save();
+    this.handleUpdate();
+    App.updateUserProgressUI();
+    
+    if (levelUp) {
+      App.triggerLevelUpCelebration(AppState.data.levelName);
+    } else {
+      App.triggerConfetti();
+    }
+    
+    // Re-render badges
+    PledgeManager.renderBadges();
+  }
+};
+
+// ==========================================
+// 9. Educational Feed Content Builder
+// ==========================================
+const EducationalFeed = {
+  init: function() {
+    const container = document.getElementById('educational-feed-container');
+    if (!container) return;
+
+    // Securely clear
+    container.textContent = '';
+
+    EducationalArticles.forEach((a, idx) => {
+      const article = document.createElement('article');
+      article.className = 'edu-item-accordion';
+      article.id = `edu-accordion-${idx}`;
+
+      const header = document.createElement('div');
+      header.className = 'edu-item-header';
+      header.setAttribute('role', 'button');
+      header.setAttribute('aria-expanded', 'false');
+      header.setAttribute('tabindex', '0');
+      header.onclick = () => this.toggleAccordion(article, header);
+      header.onkeydown = (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          this.toggleAccordion(article, header);
+        }
+      };
+
+      const title = document.createElement('h4');
+      title.textContent = a.title;
+
+      const icon = document.createElement('i');
+      icon.className = 'edu-item-header-icon';
+      icon.setAttribute('data-lucide', 'chevron-down');
+      icon.setAttribute('aria-hidden', 'true');
+
       header.appendChild(title);
-      header.appendChild(category);
-      header.appendChild(chevron);
+      header.appendChild(icon);
 
       const body = document.createElement('div');
-      body.className = 'tip-body';
-      body.id = 'tip-body-' + index;
-      body.setAttribute('role', 'region');
-      body.setAttribute('aria-labelledby', 'tip-header-' + index);
+      body.className = 'edu-item-body';
 
-      const bodyText = document.createElement('p');
-      bodyText.textContent = tip.body;
-      body.appendChild(bodyText);
-
-      if (tip.bullets && tip.bullets.length > 0) {
-        const ul = document.createElement('ul');
-        tip.bullets.forEach(b => {
-          const li = document.createElement('li');
-          li.textContent = b;
-          ul.appendChild(li);
-        });
-        body.appendChild(ul);
-      }
-
-      if (tip.impact) {
-        const impact = document.createElement('div');
-        impact.className = 'tip-impact';
-        impact.textContent = '🌿 ' + tip.impact;
-        body.appendChild(impact);
-      }
-
-      header.addEventListener('click', () => {
-        const isOpen = item.classList.contains('open');
-        // Close all others
-        $$('.tip-item').forEach(i => {
-          i.classList.remove('open');
-          const h = i.querySelector('.tip-header');
-          if (h) h.setAttribute('aria-expanded', 'false');
-        });
-        if (!isOpen) {
-          item.classList.add('open');
-          header.setAttribute('aria-expanded', 'true');
+      const content = document.createElement('div');
+      content.className = 'edu-item-body-content';
+      a.blocks.forEach(b => {
+        const el = document.createElement(b.type);
+        el.textContent = b.text;
+        if (b.type === 'li') {
+          el.style.marginLeft = '20px';
+          el.style.display = 'list-item';
         }
+        content.appendChild(el);
       });
 
-      item.appendChild(header);
-      item.appendChild(body);
-      accordion.appendChild(item);
+      body.appendChild(content);
+      article.appendChild(header);
+      article.appendChild(body);
+      container.appendChild(article);
     });
-  }
 
-  /* ---- Offset Tab ---- */
+    if (window.lucide) window.lucide.createIcons();
+  },
 
-  function renderOffsetTab() {
-    // Pre-fill offset input
-    const state = AppState.get();
-    if (state.results) {
-      $('#offset-co2-input').value = state.results.total;
+  toggleAccordion: function(articleEl, headerEl) {
+    const isOpen = articleEl.classList.contains('open');
+    
+    // Close other accordions
+    const all = document.querySelectorAll('.edu-item-accordion');
+    all.forEach(x => {
+      x.classList.remove('open');
+      const hdr = x.querySelector('.edu-item-header');
+      if (hdr) hdr.setAttribute('aria-expanded', 'false');
+    });
+
+    if (!isOpen) {
+      articleEl.classList.add('open');
+      headerEl.setAttribute('aria-expanded', 'true');
     }
-
-    // Render offset methods
-    const grid = $('#offset-methods-grid');
-    grid.innerHTML = '';
-
-    CarbonDatabase.OFFSET_METHODS.forEach(method => {
-      const card = document.createElement('div');
-      card.className = 'offset-method-card';
-
-      const icon = document.createElement('div');
-      icon.className = 'offset-method-icon';
-      icon.textContent = method.icon;
-      icon.setAttribute('aria-hidden', 'true');
-
-      const title = document.createElement('div');
-      title.className = 'offset-method-title';
-      title.textContent = method.title;
-
-      const desc = document.createElement('div');
-      desc.className = 'offset-method-desc';
-      desc.textContent = method.desc;
-
-      const factor = document.createElement('div');
-      factor.className = 'offset-method-factor';
-      factor.textContent = method.factor;
-
-      card.appendChild(icon);
-      card.appendChild(title);
-      card.appendChild(desc);
-      card.appendChild(factor);
-      grid.appendChild(card);
-    });
   }
+};
 
-  function performOffsetCalc() {
-    const tonnes = parseFloat($('#offset-co2-input').value) || 0;
-    const years = parseInt($('#offset-years').value) || 1;
+// Start application on DOM Content Loaded
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    App.init();
+  });
+}
 
-    if (tonnes <= 0) return;
-
-    const result = CarbonCalculator.calculateOffset(tonnes, years);
-    const container = $('#offset-results');
-    container.innerHTML = '';
-
-    const grid = document.createElement('div');
-    grid.className = 'offset-result-grid';
-
-    const cards = [
-      { icon: '🌳', label: 'Trees Needed', value: result.trees.toLocaleString(), sub: 'over ' + years + ' year(s)' },
-      { icon: '☀️', label: 'Solar Panels', value: result.solarPanels.toLocaleString(), sub: 'lifetime offset equivalent' },
-      { icon: '💨', label: 'Carbon Credits', value: result.windCredits.toLocaleString(), sub: '1 credit = 1 tonne CO₂' },
-      { icon: '💰', label: 'Est. Cost Range', value: '$' + result.costLow.toLocaleString() + ' – $' + result.costHigh.toLocaleString(), sub: 'voluntary carbon market' },
-      { icon: '📊', label: 'Total CO₂ to Offset', value: result.totalCO2 + 't', sub: tonnes + 't × ' + years + ' years' }
-    ];
-
-    cards.forEach(c => {
-      const card = document.createElement('div');
-      card.className = 'offset-result-card';
-
-      const icon = document.createElement('div');
-      icon.className = 'offset-result-icon';
-      icon.textContent = c.icon;
-      icon.setAttribute('aria-hidden', 'true');
-
-      const label = document.createElement('div');
-      label.className = 'offset-result-label';
-      label.textContent = c.label;
-
-      const value = document.createElement('div');
-      value.className = 'offset-result-value';
-      value.textContent = c.value;
-
-      const sub = document.createElement('div');
-      sub.className = 'offset-result-sub';
-      sub.textContent = c.sub;
-
-      card.appendChild(icon);
-      card.appendChild(label);
-      card.appendChild(value);
-      card.appendChild(sub);
-      grid.appendChild(card);
-    });
-
-    container.appendChild(grid);
-  }
-
-  /* ---- Utility ---- */
-
-  function animateNumber(el, start, end, duration) {
-    const startTime = performance.now();
-
-    function tick(now) {
-      const elapsed = now - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-      // Ease out cubic
-      const eased = 1 - Math.pow(1 - progress, 3);
-      const current = start + (end - start) * eased;
-      el.textContent = current.toFixed(1);
-      if (progress < 1) requestAnimationFrame(tick);
-    }
-
-    requestAnimationFrame(tick);
-  }
-
-  /* ---- Boot ---- */
-  document.addEventListener('DOMContentLoaded', init);
-
-  return { showScreen, renderDashboard, renderActionHub, renderLearnTab, renderOffsetTab };
-})();
+// Export for Node.js testing environments
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { CarbonCalculator, AppState, PledgeLibrary, FoodprintIndex };
+}
