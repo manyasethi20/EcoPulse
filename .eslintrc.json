@@ -10,6 +10,11 @@
     "ecmaVersion": 12,
     "sourceType": "module"
   },
+  "globals": {
+    "Chart": "readonly",
+    "lucide": "readonly",
+    "confetti": "readonly"
+  },
   "rules": {
     "no-unused-vars": "warn",
     "no-console": "off",

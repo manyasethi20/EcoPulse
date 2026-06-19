@@ -1,4 +1,4 @@
-const { CarbonCalculator } = require('../app.js');
+import { CarbonCalculator } from '../js/calculator.js';
 
 describe('CarbonCalculator', () => {
   let profile;

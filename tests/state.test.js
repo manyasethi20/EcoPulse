@@ -1,4 +1,4 @@
-const { AppState } = require('../app.js');
+import { AppState } from '../js/state.js';
 
 // Mock localStorage for Node.js Jest environment
 global.localStorage = {
@@ -65,5 +65,20 @@ describe('AppState Manager', () => {
     
     // Values should remain as defaults
     expect(AppState.data.xp).toBe(0);
+  });
+
+  test('adds XP and handles leveling up correctly', () => {
+    // Adding XP that does not level up
+    let leveledUp = AppState.addXP(50);
+    expect(AppState.data.xp).toBe(50);
+    expect(AppState.data.level).toBe(1);
+    expect(leveledUp).toBe(false);
+
+    // Adding XP that levels up
+    leveledUp = AppState.addXP(60); // Total 110 XP
+    expect(AppState.data.xp).toBe(110);
+    expect(AppState.data.level).toBe(2);
+    expect(AppState.data.levelName).toBe('Green Trailblazer');
+    expect(leveledUp).toBe(true);
   });
 });
